@@ -28,7 +28,7 @@
 | Platform | Build Succeeded | Process Launched | Menu Reached | Reference Track Completed | Blocking Prerequisite / Notes |
 | --- | :---: | :---: | :---: | :---: | --- |
 | **eXtreme desktop (`x86_64` Linux)** | **Yes**, headless and windowed | **Yes** | **Yes**, confirmed interactively | **SkidOrDie finished in 1:52.950** | Steering, respawn, and mixer output verified. GoodMorning, preference persistence, and rendering defects remain open. See the [desktop report](desktop-report.md). |
-| **eXtreme Android (`arm64-v8a`)** | **Yes**, debug APK verified | **Pending** | **Pending** | **Pending** | Desktop startup without Cranelift stops at an unresolved target. See the [Android report](android-report.md). |
+| **eXtreme Android (`arm64-v8a`)** | **Yes**, debug APK verified | **Yes**, emulator and phone | **Yes** | **ParadiseIsland replay** | Physical phone benchmark at 1196×540. See the [Android report](android-report.md). |
 | **Retail desktop (`x86_64` Linux)** | **Yes**, headless and windowed | **Yes** | **Blocked** | **Pending** | StarForce 3.04.071.019 import `TMSUNRISE.DLL!ord1` at `0x00c42005`. |
 | **Retail and stub Android (`arm64-v8a`)** | **Yes**, debug APKs built | **Pending** | **Pending** | **Pending** | Device verification pending. |
 | **Nintendo Switch (Homebrew)** | **NO (Feasibility evaluated)** | **NO** | **NO** | **NO** | Blocked by upstream `wgpu` having no Horizon OS/NVN/deko3d backend, no Tier-1/2 Rust `std` Switch target, no SDL3 Switch driver, and missing Switch test hardware + `devkitA64`. See [Switch Feasibility Report](switch-feasibility-report.md). |
