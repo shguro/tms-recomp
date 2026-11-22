@@ -94,7 +94,9 @@ Both debug APKs assembled cleanly with **Android NDK r27c**, **Rust `aarch64-lin
 - Rust `aarch64-linux-android` target (`rustup target add aarch64-linux-android`)
 - Local extracted game files prepared via `tools/setup.py`
 
-### Build the `arm64-v8a` Debug APK Locally
+### Build and install the eXtreme debug APK
+
+Prepare the pinned toolkit and game installation using the [project README](../README.md#build-from-source) and [eXtreme profile](../games/tm-sunrise-extreme/README.md). Set the Android paths to your local installations, then build with NDK r27c and JDK 21. The app's minimum API is 29.
 
 ```sh
 export JAVA_HOME="$PWD/local/tools/jdk21"
@@ -102,46 +104,20 @@ export ANDROID_HOME="$PWD/local/tools/android-sdk"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export ANDROID_NDK_HOME="$PWD/local/tools/android-ndk/android-ndk-r27c"
 export PATH="$JAVA_HOME/bin:$PWD/local/tools/llvm/bin:$PWD/recomp-toolkit/.venv/bin:$PATH"
+export CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2
 
-# Minimal standalone Android runtime test APK (no game files required)
 recomp-toolkit/.venv/bin/python recomp-toolkit/tools/build.py \
-  --stub --target android --no-install
-
-# TrackMania Sunrise profile arm64-v8a debug APK
-recomp-toolkit/.venv/bin/python recomp-toolkit/tools/build.py \
-  --game-dir "$PWD/games/tm-sunrise" \
-  --build-root "$PWD/local/build/tm-sunrise" \
-  --target android --no-install
+  --game-dir "$PWD/games/tm-sunrise-extreme" \
+  --build-root "$PWD/local/build/tm-sunrise-extreme" \
+  --jobs 2 --target android --no-install
 ```
 
-### Install & Push Local Game Data on a Physical ARM64 Device
+Add `--regenerate` on the first build or after changing the translator or code map. For USB installation, select the target device explicitly if you also have an emulator running.
 
 ```sh
-# 1. Connect an ARM64 Android 10+ (API 29+, Vulkan 1.1+) device with USB debugging enabled
-local/tools/android-sdk/platform-tools/adb devices
-
-# 2. Install the debug APK
-local/tools/android-sdk/platform-tools/adb install -r \
-  local/build/tm-sunrise/android/app/build/outputs/apk/debug/app-debug.apk
-
-# 3. Push local game files (or import via RecompActivity's folder/ZIP picker on first launch)
-recomp-toolkit/.venv/bin/python recomp-toolkit/tools/build.py \
-  --game-dir "$PWD/games/tm-sunrise" \
-  --build-root "$PWD/local/build/tm-sunrise" \
-  --target android --push-game
+"$ANDROID_HOME/platform-tools/adb" devices
+"$ANDROID_HOME/platform-tools/adb" -s DEVICE_SERIAL install -r \
+  local/build/tm-sunrise-extreme/android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
----
-
-## 4. Hardware Verification Status & Pending Checks
-
-- **ADB check in current environment:** `emulator-5556` is online. Physical ARM64 testing remains pending.
-- **Build succeeded:** **YES** (`dev.recompkit.stub` and `dev.recompkit.tmsunrise` `arm64-v8a` debug APKs).
-- **Process launched / Menu reached / Reference track completed on device:** **PENDING** (requires physical ARM64 Android device + authorized unpacked TrackMania Sunrise eXtreme executable).
-
-### Pending Physical-Device Verification Checklist
-- [ ] Install & launch `dev.recompkit.stub` APK on physical ARM64 device; confirm Vulkan surface creation, SDL3 audio (`AAudio`/`OpenSL ES`), touch/controller input, and pause/resume lifecycle.
-- [ ] Install `dev.recompkit.tmsunriseextreme` and import the local eXtreme game data.
-- [ ] Verify offline load, completion, and restart of `GoodMorning.Challenge.Gbx` with controller input, audio, and persistent settings across background/foreground transitions and full process exit + relaunch.
-- [ ] Record device model, Android version, display resolution, FPS, and frame-time percentiles on the reference track.
-- [ ] Confirm zero runtime JIT fallback requirement (`--no-pcode` coverage).
+On first launch, select the folder or ZIP containing your local eXtreme game data. The Android build has reached Solo and played a saved ParadiseIsland replay on a physical ARM64 phone. Offline race completion, device lifecycle behavior, and audio fidelity still need systematic verification across devices.
