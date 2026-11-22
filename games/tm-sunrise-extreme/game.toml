@@ -1,0 +1,33 @@
+[game]
+id = "tm-sunrise-extreme"
+name = "TrackMania Sunrise eXtreme"
+app_name = "TmSunriseExtremeRecomp"
+bundle_id = "dev.recompkit.tmsunriseextreme"
+executable = "TmSunrise.exe"
+sha256 = "e59dfc7eaa5314e85b2b0df6f40ef7ba01a23bd5a9525f84407f5dff301df4fe"
+image_base = 0x00400000
+guest_size = 0x20000000
+host_arena_base = 0
+entry_point = 0x0040259a
+guest_root = 'C:\TMSX'
+windows_version = "5.1.2600"
+
+[setup]
+supported_version = "TrackMania Sunrise eXtreme 0.1.5.0 (Unpacked Portable)"
+source_notes = "Extract TMSX-TechXPortable.zip locally and select the TMSX/ folder containing TmSunrise.exe."
+
+[translate]
+code_map = "metadata"
+discover = true
+discovery_evidence = "metadata/discovery.tsv"
+entry_points = [0x0040259a]
+native = { header = "native/mslu.h", sources = ["native/mslu.cpp"] }
+
+[render]
+d3d8_wgpu = true
+d3d9_advertise_pixel_shaders = false
+d3d9_pace_fullscreen_present = true
+d3d9_full_detail_mips = true
+
+[controls]
+mobile_control = "mobile-only"

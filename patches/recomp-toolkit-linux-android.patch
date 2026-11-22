@@ -1,0 +1,3177 @@
+diff --git a/cmake/RustGraphics.cmake b/cmake/RustGraphics.cmake
+index 9c43007c..f9081159 100644
+--- a/cmake/RustGraphics.cmake
++++ b/cmake/RustGraphics.cmake
+@@ -1,5 +1,13 @@
+ find_program(RECOMP_GRAPHICS_CARGO cargo REQUIRED)
+-if(CMAKE_CROSSCOMPILING OR (CMAKE_OSX_ARCHITECTURES AND
++if(ANDROID)
++  if(NOT RECOMP_RENDERER_CARGO_TARGET)
++    if(ANDROID_ABI STREQUAL "arm64-v8a")
++      set(RECOMP_RENDERER_CARGO_TARGET "aarch64-linux-android")
++    else()
++      message(FATAL_ERROR "Unsupported Android ABI for Rust graphics: ${ANDROID_ABI}")
++    endif()
++  endif()
++elseif(CMAKE_CROSSCOMPILING OR (CMAKE_OSX_ARCHITECTURES AND
+     NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
+   message(FATAL_ERROR "Rust graphics integration requires a native single-architecture build")
+ endif()
+@@ -9,18 +17,20 @@ if(RECOMP_RENDERER_CARGO_TARGET)
+   if(NOT RECOMP_RENDERER_CARGO_TARGET MATCHES "^[A-Za-z0-9_+.-]+$")
+     message(FATAL_ERROR "Invalid renderer Cargo target triple: ${RECOMP_RENDERER_CARGO_TARGET}")
+   endif()
+-  if(DEFINED ENV{RUSTC} AND NOT "$ENV{RUSTC}" STREQUAL "")
+-    set(RECOMP_RUSTC "$ENV{RUSTC}")
+-  else()
+-    find_program(RECOMP_RUSTC rustc REQUIRED)
+-  endif()
+-  execute_process(COMMAND "${RECOMP_RUSTC}" -vV RESULT_VARIABLE RECOMP_RUSTC_STATUS
+-    OUTPUT_VARIABLE RECOMP_RUSTC_VERSION ERROR_VARIABLE RECOMP_RUSTC_ERROR)
+-  if(NOT RECOMP_RUSTC_STATUS EQUAL 0 OR NOT RECOMP_RUSTC_VERSION MATCHES "host: ([^\r\n]+)")
+-    message(FATAL_ERROR "Could not determine Rust host target: ${RECOMP_RUSTC_ERROR}")
+-  endif()
+-  if(NOT RECOMP_RENDERER_CARGO_TARGET STREQUAL CMAKE_MATCH_1)
+-    message(FATAL_ERROR "Renderer Cargo target ${RECOMP_RENDERER_CARGO_TARGET} does not match Rust host ${CMAKE_MATCH_1}")
++  if(NOT ANDROID)
++    if(DEFINED ENV{RUSTC} AND NOT "$ENV{RUSTC}" STREQUAL "")
++      set(RECOMP_RUSTC "$ENV{RUSTC}")
++    else()
++      find_program(RECOMP_RUSTC rustc REQUIRED)
++    endif()
++    execute_process(COMMAND "${RECOMP_RUSTC}" -vV RESULT_VARIABLE RECOMP_RUSTC_STATUS
++      OUTPUT_VARIABLE RECOMP_RUSTC_VERSION ERROR_VARIABLE RECOMP_RUSTC_ERROR)
++    if(NOT RECOMP_RUSTC_STATUS EQUAL 0 OR NOT RECOMP_RUSTC_VERSION MATCHES "host: ([^\r\n]+)")
++      message(FATAL_ERROR "Could not determine Rust host target: ${RECOMP_RUSTC_ERROR}")
++    endif()
++    if(NOT RECOMP_RENDERER_CARGO_TARGET STREQUAL CMAKE_MATCH_1)
++      message(FATAL_ERROR "Renderer Cargo target ${RECOMP_RENDERER_CARGO_TARGET} does not match Rust host ${CMAKE_MATCH_1}")
++    endif()
+   endif()
+   list(APPEND RECOMP_GRAPHICS_TARGET_ARGS --target "${RECOMP_RENDERER_CARGO_TARGET}")
+   set(RECOMP_GRAPHICS_TARGET_SUFFIX "/${RECOMP_RENDERER_CARGO_TARGET}")
+diff --git a/dx/CMakeLists.txt b/dx/CMakeLists.txt
+index 1028b3a2..a2c8a2ab 100644
+--- a/dx/CMakeLists.txt
++++ b/dx/CMakeLists.txt
+@@ -114,6 +114,10 @@ add_custom_target(d3d9_generated DEPENDS "${RECOMP_D3D9_INTERFACES}" "${RECOMP_D
+                   "${RECOMP_D3DX9_33_INTERFACES}" "${RECOMP_D3DX9_IMPORTS}"
+                   "${RECOMP_COM_HOST_SLOTS}")
+ 
++set_property(SOURCE d3d9.cpp APPEND PROPERTY COMPILE_DEFINITIONS
++  RECOMP_D3D9_ADVERTISE_PIXEL_SHADERS=${RECOMP_D3D9_ADVERTISE_PIXEL_SHADERS}
++  RECOMP_D3D9_PACE_FULLSCREEN_PRESENT=${RECOMP_D3D9_PACE_FULLSCREEN_PRESENT}
++  RECOMP_D3D9_FULL_DETAIL_MIPS=${RECOMP_D3D9_FULL_DETAIL_MIPS})
+ add_library(recomp_dx OBJECT ${RECOMP_DX_SOURCES})
+ add_dependencies(recomp_dx d3d8_com_tables d3d9_generated)
+ target_include_directories(recomp_dx PUBLIC "${RECOMP_D3D8_GENERATED_DIR}" "${RECOMP_D3D9_GENERATED_DIR}")
+diff --git a/dx/bink.cpp b/dx/bink.cpp
+index 4f9178c7..fb63dbc3 100644
+--- a/dx/bink.cpp
++++ b/dx/bink.cpp
+@@ -562,15 +562,38 @@ void BinkDoFrame(X86 *c) {
+     write_frame_count(rec, *p);
+ }
+ 
++bool bink_seek_frame(BinkPlayer &p, uint32_t frame) {
++    for (AVPacket *packet : p.video_packets)
++        av_packet_free(&packet);
++    p.video_packets.clear();
++    p.pending.clear();
++    p.pending_pos = 0;
++    p.eof = false;
++    p.flushed = false;
++    avcodec_flush_buffers(p.video);
++    if (p.audio)
++        avcodec_flush_buffers(p.audio);
++    AVStream *stream = p.input->streams[p.video_index];
++    int64_t ts = av_rescale_q((int64_t)(frame - 1), av_inv_q(p.fps), stream->time_base);
++    int rc = av_seek_frame(p.input, p.video_index, ts, AVSEEK_FLAG_BACKWARD);
++    p.failed = rc < 0;
++    return !p.failed || decoder_error("seek video frame", rc);
++}
++
+ void BinkNextFrame(X86 *c) {
+     uint32_t rec = arg(c, 0);
+     if (BinkPlayer *p = player_for(rec)) {
+         if (host_close_requested()) {
+             p->current = p->count;
+             p->displayed = p->count;
+-        } else if (p->current < UINT32_MAX) {
++        } else if (!p->failed) {
+             p->displayed = p->current;
+-            ++p->current;
++            if (p->current < p->count) {
++                ++p->current;
++            } else if (bink_seek_frame(*p, 1)) {
++                p->current = 1;
++                p->t0 = p->paused ? p->paused_at : host_millis();
++            }
+         }
+         write_frame_count(rec, *p);
+         service_audio(rec, *p);
+@@ -693,23 +716,8 @@ void BinkGoto(X86 *c) {
+         frame = 1;
+     if (frame > p->count)
+         frame = p->count;
+-    for (AVPacket *packet : p->video_packets)
+-        av_packet_free(&packet);
+-    p->video_packets.clear();
+-    p->pending.clear();
+-    p->pending_pos = 0;
+-    p->eof = false;
+-    p->flushed = false;
+-    p->failed = false;
+     p->have_frame = false;
+-    avcodec_flush_buffers(p->video);
+-    if (p->audio)
+-        avcodec_flush_buffers(p->audio);
+-    AVStream *stream = p->input->streams[p->video_index];
+-    int64_t ts = av_rescale_q((int64_t)(frame - 1), av_inv_q(p->fps), stream->time_base);
+-    int rc = av_seek_frame(p->input, p->video_index, ts, AVSEEK_FLAG_BACKWARD);
+-    if (rc < 0) {
+-        p->failed = !decoder_error("seek video frame", rc);
++    if (!bink_seek_frame(*p, frame)) {
+         p->displayed = p->count;
+     } else {
+         p->displayed = p->current;
+@@ -807,6 +815,59 @@ void BinkCopyToBuffer(X86 *c) {
+     p->blit_ms += host_millis() - blit_start;
+ }
+ 
++void BinkCopyToBufferRect(X86 *c) {
++    set_eax(c, 0);
++    BinkPlayer *p = player_for(arg(c, 0));
++    if (!p || !p->have_frame || p->failed)
++        return;
++    uint32_t dst_buf = arg(c, 1), dst_h = arg(c, 3);
++    int64_t pitch = (int32_t)arg(c, 2);
++    uint32_t dst_x = arg(c, 4), dst_y = arg(c, 5);
++    uint32_t src_x = arg(c, 6), src_y = arg(c, 7), src_w = arg(c, 8), src_h = arg(c, 9);
++    uint32_t flags = arg(c, 10);
++    uint32_t type = flags & 0xff;
++    if (type == 1) // BINKSURFACE24
++        type = VIDEO_BGR24;
++    if (type != VIDEO_RGB565 && type != VIDEO_RGB555 && type != VIDEO_XRGB8888 &&
++        type != VIDEO_BGR24)
++        return;
++    uint32_t fw = (uint32_t)p->frame->width, fh = (uint32_t)p->frame->height;
++    if (src_x >= fw || src_y >= fh || !src_w || !src_h)
++        return;
++    uint32_t copy_w = std::min(src_w, fw - src_x);
++    uint32_t copy_h = std::min(src_h, std::min(fh - src_y, dst_h > dst_y ? dst_h - dst_y : 0u));
++    if (!copy_w || !copy_h)
++        return;
++    int64_t bpp = type == VIDEO_XRGB8888 ? 4 : type == VIDEO_BGR24 ? 3 : 2;
++    int64_t xbytes = (int64_t)dst_x * bpp;
++    int64_t row_bytes = (int64_t)copy_w * bpp;
++    if (!dst_buf || xbytes + row_bytes > (pitch < 0 ? -pitch : pitch)) {
++        video_error("copy rect destination is outside guest memory or pitch");
++        return;
++    }
++    int64_t first_row = pitch < 0 ? (dst_h - 1 - dst_y) * -pitch : dst_y * pitch;
++    int64_t last_row = first_row + (copy_h - 1) * pitch;
++    uint64_t low = (uint64_t)dst_buf + xbytes + std::min(first_row, last_row);
++    uint64_t high = (uint64_t)dst_buf + xbytes + std::max(first_row, last_row);
++    if (high > UINT32_MAX || high - low + row_bytes > UINT32_MAX ||
++        !gm_valid((uint32_t)low, (uint32_t)(high - low + row_bytes))) {
++        video_error("copy rect destination is outside guest memory or pitch");
++        return;
++    }
++    int64_t start = dst_buf + first_row + xbytes;
++    uint32_t blit_start = host_millis();
++    for (uint32_t row = 0; row < copy_h; ++row) {
++        uint32_t sy = src_y + row;
++        uint8_t *dest = g_mem + start + row * pitch;
++        video_frame_convert_row(
++            dest, p->frame->data[0] + (ptrdiff_t)sy * p->frame->linesize[0] + src_x,
++            p->frame->data[1] + (ptrdiff_t)(sy / 2) * p->frame->linesize[1] + src_x / 2,
++            p->frame->data[2] + (ptrdiff_t)(sy / 2) * p->frame->linesize[2] + src_x / 2, copy_w,
++            (VideoSurfaceType)type);
++    }
++    p->blit_ms += host_millis() - blit_start;
++}
++
+ void BinkClose(X86 *c) {
+     uint32_t rec = arg(c, 0);
+     if (g_players.erase(rec))
+@@ -945,6 +1006,9 @@ void BinkService(X86 *c) {
+ void BinkCopyToBuffer(X86 *c) {
+     ret0(c);
+ }
++void BinkCopyToBufferRect(X86 *c) {
++    ret0(c);
++}
+ void BinkSetVolume(X86 *c) {
+     ret0(c);
+ }
+@@ -1023,6 +1087,9 @@ const ImportShim g_video_shims[] = {
+     BINK(NextFrame, 4, BinkNextFrame),
+     BINK(Wait, 4, BinkWait),
+     BINK(CopyToBuffer, 28, BinkCopyToBuffer),
++    BINK(CopyToBufferRect, 44, BinkCopyToBufferRect),
++    BINK(SetSoundTrack, 8, ret0),
++    BINK(SetPan, 12, ret0),
+     BINK(ShouldSkip, 4, BinkShouldSkip),
+     BINK(Service, 4, BinkService),
+     BINK(GetError, 0, BinkGetError),
+diff --git a/dx/com.h b/dx/com.h
+index 71088c04..5e51eb88 100644
+--- a/dx/com.h
++++ b/dx/com.h
+@@ -501,6 +501,7 @@ struct ComObj {
+ 
+     std::shared_ptr<D3d9HostDevice> d3d9_device;
+     uint32_t d3d9_focus_window = 0;
++    bool d3d9_software_vp = false;
+     std::shared_ptr<D3d9HostResource> d3d9_resource;
+     bool d3d9_owner_retained = false;
+     uint32_t d3d9_parent = 0; // owning texture/volume texture for a level view
+diff --git a/dx/d3d9.cpp b/dx/d3d9.cpp
+index 31d6a26d..41d505d5 100644
+--- a/dx/d3d9.cpp
++++ b/dx/d3d9.cpp
+@@ -439,10 +439,14 @@ static std::vector<recomp::d3d::D3d9DisplayMode> d3d9_display_modes() {
+         {1600, 1200}, {1680, 1050}, {1920, 1080}, {1920, 1200}, {1920, 1440}, {2048, 1536},
+         {2560, 1440}, {2560, 1600}, {2560, 1920},
+     };
+-    for (const auto &m : kStandard)
+-        add_display_mode(modes, m[0], m[1]);
+     int32_t host_w = 0, host_h = 0;
+-    if (host_display_screen(&host_w, &host_h) && host_w > 0 && host_h > 0)
++    const bool has_host_mode = host_display_screen(&host_w, &host_h);
++    const char *limit = os_getenv("RECOMP_D3D9_LIMIT_DISPLAY_MODES");
++    const bool limit_modes = has_host_mode && limit && strcmp(limit, "1") == 0;
++    for (const auto &m : kStandard)
++        if (!limit_modes || (m[0] <= uint32_t(host_w) && m[1] <= uint32_t(host_h)))
++            add_display_mode(modes, m[0], m[1]);
++    if (has_host_mode)
+         add_display_mode(modes, (uint32_t)host_w, (uint32_t)host_h);
+     return modes;
+ }
+@@ -595,6 +599,16 @@ void D9_CheckDeviceFormatConversion(X86 *c) {
+     com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_format_conversion(request)));
+ }
+ 
++static void write_device_caps(uint32_t out, const recomp::d3d::D3d9CapsResult &result) {
++    constexpr uint32_t pixel_shader_version = 204;
++    constexpr uint32_t pixel_shader_20_caps = 264;
++    memcpy(gm_ptr(out), result.caps.data(), 304);
++    if (!RECOMP_D3D9_ADVERTISE_PIXEL_SHADERS) {
++        wr32(out + pixel_shader_version, 0);
++        memset(gm_ptr(out + pixel_shader_20_caps), 0, 5 * sizeof(uint32_t));
++    }
++}
++
+ void D9_GetDeviceCaps(X86 *c) {
+     uint32_t out = arg(c, 3);
+     if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 || !out ||
+@@ -611,7 +625,7 @@ void D9_GetDeviceCaps(X86 *c) {
+         com_ret(c, bridge_result(c, result.status));
+         return;
+     }
+-    memcpy(gm_ptr(out), result.caps.data(), 304);
++    write_device_caps(out, result);
+     com_ret(c, D3D_OK9);
+ }
+ void D9_GetAdapterMonitor(X86 *c) {
+@@ -642,6 +656,7 @@ void D9_CreateDevice(X86 *c) {
+     request.adapter = arg(c, 1);
+     request.device_type = arg(c, 2);
+     request.behavior_flags = arg(c, 4);
++    request.full_detail_mips = RECOMP_D3D9_FULL_DETAIL_MIPS;
+     request.present.width = rd32(present + 0);
+     request.present.height = rd32(present + 4);
+     request.present.format = rd32(present + 8);
+@@ -759,29 +774,35 @@ void Dev_SetScissorRect(X86 *c) {
+ static ComObj *device_backbuffer(ComObj *dev);
+ static ComObj *device_depthbuffer(ComObj *dev);
+ 
+-static void d3d9_reset_transaction(ComObj *dev, const recomp::d3d::D3d9ResetRequest &request,
++static void d3d9_reset_transaction(ComObj *dev, recomp::d3d::D3d9ResetRequest &request,
+                                    recomp::d3d::D3d9ResetResult &result) {
+-    result = dev->d3d9_device->reset(request);
+-    if (result.status.code != recomp::d3d::StatusCode::Ok)
+-        return;
+     recomp::d3d::ValuesResult ids = dev->d3d9_device->registered_resource_ids();
+     if (ids.status.code != recomp::d3d::StatusCode::Ok) {
+-        dev->d3d9_device->abort_reset();
++        result.present = request.present;
+         result.status = ids.status;
+         return;
+     }
++    const auto &bindings = dev->d3d9_device->live_bindings;
++    std::vector<ComObj *> retained;
+     for (uint32_t id : ids.values) {
+         ComObj *o = com_get(id);
+         if (!o || !o->d3d9_resource || o->d3d9_parent || o->d3d9_implicit ||
+             o->dev_d3d != dev->id) {
+-            dev->d3d9_device->abort_reset();
+             LOGW("d3d9: reset holder %u is not a root resource of this device", id);
++            result.present = request.present;
+             result.status.code = recomp::d3d::StatusCode::InvalidArgument;
+             return;
+         }
++        if (o->refs == o->internal_refs &&
++            o->refs == std::count(bindings.begin(), bindings.end(), id))
++            request.binding_only_resources.push_back(id);
++        else
++            retained.push_back(o);
+     }
+-    for (uint32_t id : ids.values) {
+-        ComObj *o = com_get(id);
++    result = dev->d3d9_device->reset(request);
++    if (result.status.code != recomp::d3d::StatusCode::Ok)
++        return;
++    for (ComObj *o : retained) {
+         recomp::d3d::Status prepared =
+             dev->d3d9_device->prepare_resource_reset(o->id, *o->d3d9_resource);
+         if (prepared.code != recomp::d3d::StatusCode::Ok) {
+@@ -796,8 +817,8 @@ static void d3d9_reset_transaction(ComObj *dev, const recomp::d3d::D3d9ResetRequ
+         result.status = ready;
+         return;
+     }
+-    for (uint32_t id : ids.values)
+-        dev->d3d9_device->commit_resource_reset(id, *com_get(id)->d3d9_resource);
++    for (ComObj *o : retained)
++        dev->d3d9_device->commit_resource_reset(o->id, *o->d3d9_resource);
+     result = dev->d3d9_device->finish_reset();
+     d3d9_refresh_bindings(dev);
+ }
+@@ -892,6 +913,30 @@ void Dev_TestCooperativeLevel(X86 *c) {
+     }
+     com_ret(c, D3D_OK9);
+ }
++
++void Dev_ValidateDevice(X86 *c) {
++    ComObj *dev = this_device9(c);
++    uint32_t passes = arg(c, 1);
++    if (!dev || !dev->d3d9_device || (passes && !gm_valid(passes, 4))) {
++        com_ret(c, D3DERR_INVALIDCALL);
++        return;
++    }
++    auto result = dev->d3d9_device->test_cooperative_level();
++    if (result.status.code != recomp::d3d::StatusCode::Ok) {
++        com_ret(c, bridge_result(c, result.status));
++        return;
++    }
++    if (result.value != 0) {
++        com_ret(c, D3DERR_DEVICELOST);
++        return;
++    }
++    // The renderer implements supported texture blending in a single pass.
++    // Detailed state validation occurs when building the draw pipeline.
++    if (passes)
++        wr32(passes, 1);
++    com_ret(c, D3D_OK9);
++}
++
+ void Dev_GetAvailableTextureMem(X86 *c) {
+     ComObj *dev = this_device9(c);
+     if (!dev || !dev->d3d9_device) {
+@@ -901,6 +946,13 @@ void Dev_GetAvailableTextureMem(X86 *c) {
+     recomp::d3d::ValueResult result = dev->d3d9_device->available_texture_mem();
+     if (result.status.code != recomp::d3d::StatusCode::Ok) {
+         std::string message(result.status.message.data(), result.status.message.size());
++        if (result.status.code == recomp::d3d::StatusCode::Unsupported ||
++            message.find("only on the Metal backend") != std::string::npos) {
++            log_once("d3d9.available_texture_mem.fallback",
++                     "d3d9: GetAvailableTextureMem fallback (512 MB) on non-Metal backend");
++            set_eax(c, 512u * 1024u * 1024u);
++            return;
++        }
+         LOGW("d3d9: GetAvailableTextureMem: %s", message.c_str());
+         imports_unsupported(c);
+         return;
+@@ -994,12 +1046,25 @@ void Dev_GetDeviceCaps(X86 *c) {
+         return;
+     }
+     if (result.caps.size() >= 304)
+-        memcpy(gm_ptr(out), result.caps.data(), 304);
++        write_device_caps(out, result);
+     com_ret(c, D3D_OK9);
+ }
+ void Dev_EvictManagedResources(X86 *c) {
+     com_ret(c, this_device9(c) ? D3D_OK9 : D3DERR_INVALIDCALL);
+ }
++void Dev_SetSoftwareVertexProcessing(X86 *c) {
++    ComObj *dev = this_device9(c);
++    if (!dev || !dev->d3d9_device) {
++        com_ret(c, D3DERR_INVALIDCALL);
++        return;
++    }
++    dev->d3d9_software_vp = arg(c, 1) != 0;
++    com_ret(c, D3D_OK9);
++}
++void Dev_GetSoftwareVertexProcessing(X86 *c) {
++    ComObj *dev = this_device9(c);
++    com_ret(c, (dev && dev->d3d9_software_vp) ? 1u : 0u);
++}
+ void Dev_BeginScene(X86 *c) {
+     ComObj *dev = this_device9(c);
+     if (!dev || !dev->d3d9_device) {
+@@ -1140,8 +1205,11 @@ void Dev_Present(X86 *c) {
+                                 (int)result.height, fullscreen, !fullscreen);
+         }
+     }
+-    const uint32_t interval = dev->d3d9_device->effective_present().presentation_interval;
+-    if (interval != 0x80000000u) {
++    const uint32_t immediate = 0x80000000u;
++    uint32_t interval = present_params.presentation_interval;
++    if (RECOMP_D3D9_PACE_FULLSCREEN_PRESENT && fullscreen && interval == immediate)
++        interval = 1;
++    if (interval != immediate) {
+         const int refreshes = interval >= 8u ? 4 : interval >= 4u ? 3 : interval == 2u ? 2 : 1;
+         const double delay = host_present_refresh_delay(refreshes);
+         if (delay > 0)
+@@ -4724,6 +4792,17 @@ void Dev_CreateQuery(X86 *c) {
+         com_ret(c, D3DERR_INVALIDCALL);
+         return;
+     }
++    if (out && !gm_valid(out, 4)) {
++        com_ret(c, D3DERR_INVALIDCALL);
++        return;
++    }
++    if (type != 8 && type != 9) {
++        log_once("d3d9.create_query.unavailable",
++                 "d3d9: CreateQuery type %u not supported by driver; returning D3DERR_NOTAVAILABLE",
++                 type);
++        com_ret(c, D3DERR_NOTAVAILABLE);
++        return;
++    }
+     recomp::d3d::ValueResult result = dev->d3d9_device->create_query(type);
+     if (!out) {
+         if (result.status.code == recomp::d3d::StatusCode::Ok && result.value) {
+@@ -4734,12 +4813,6 @@ void Dev_CreateQuery(X86 *c) {
+         }
+         return;
+     }
+-    if (!gm_valid(out, 4)) {
+-        if (result.status.code == recomp::d3d::StatusCode::Ok && result.value)
+-            dev->d3d9_device->destroy_query(result.value);
+-        com_ret(c, D3DERR_INVALIDCALL);
+-        return;
+-    }
+     if (result.status.code != recomp::d3d::StatusCode::Ok) {
+         com_ret(c, bridge_result(c, result.status));
+         return;
+@@ -6804,6 +6877,7 @@ static void d3d9_device_destroy(ComObj *o) {
+     }
+     o->dev_d3d = 0;
+     o->d3d9_focus_window = 0;
++    o->d3d9_software_vp = false;
+ }
+ 
+ static void d3d9_child_refs_changed(ComObj *o) {
+diff --git a/dx/d3d9_bindings.json b/dx/d3d9_bindings.json
+index b1d10e4b..cc1c3e59 100644
+--- a/dx/d3d9_bindings.json
++++ b/dx/d3d9_bindings.json
+@@ -58,6 +58,8 @@
+       "GetDeviceCaps": "Dev_GetDeviceCaps",
+       "GetDisplayMode": "Dev_GetDisplayMode",
+       "SetGammaRamp": "Dev_SetGammaRamp",
++      "SetSoftwareVertexProcessing": "Dev_SetSoftwareVertexProcessing",
++      "GetSoftwareVertexProcessing": "Dev_GetSoftwareVertexProcessing",
+       "GetNumberOfSwapChains": "Dev_GetNumberOfSwapChains",
+       "Reset": "Dev_Reset",
+       "Present": "Dev_Present",
+@@ -90,6 +92,7 @@
+       "SetTexture": "Dev_SetTexture",
+       "SetTextureStageState": "Dev_SetTextureStageState",
+       "SetSamplerState": "Dev_SetSamplerState",
++      "ValidateDevice": "Dev_ValidateDevice",
+       "SetScissorRect": "Dev_SetScissorRect",
+       "DrawPrimitive": "Dev_DrawPrimitive",
+       "DrawIndexedPrimitive": "Dev_DrawIndexedPrimitive",
+@@ -155,6 +158,8 @@
+       "EvictManagedResources": "native",
+       "GetDisplayMode": "rust",
+       "SetGammaRamp": "native",
++      "SetSoftwareVertexProcessing": "native",
++      "GetSoftwareVertexProcessing": "native",
+       "GetNumberOfSwapChains": "rust",
+       "Reset": "rust",
+       "Present": "rust",
+@@ -206,6 +211,7 @@
+       "GetTextureStageState": "rust",
+       "SetSamplerState": "rust",
+       "GetSamplerState": "rust",
++      "ValidateDevice": "rust",
+       "SetScissorRect": "rust",
+       "GetScissorRect": "rust",
+       "SetTexture": "rust",
+diff --git a/dx/dinput.cpp b/dx/dinput.cpp
+index 1275c6f3..bc57ed74 100644
+--- a/dx/dinput.cpp
++++ b/dx/dinput.cpp
+@@ -55,6 +55,8 @@ static const uint8_t IID_IDirectInput7A_[16] =
+     IID_BYTES(0x9A4CB684, 0x236D, 0x11D3, 0x8E, 0x9D, 0x00, 0xC0, 0x4F, 0x68, 0x44, 0xAE);
+ static const uint8_t IID_IDirectInputDevice7A_[16] =
+     IID_BYTES(0x57D7C6BC, 0x2356, 0x11D3, 0x8E, 0x9D, 0x00, 0xC0, 0x4F, 0x68, 0x44, 0xAE);
++static const uint8_t IID_IDirectInput8W_[16] =
++    IID_BYTES(0xBF798031, 0x483A, 0x4DA2, 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00);
+ 
+ static const uint8_t GUID_SysMouse_[16] =
+     IID_BYTES(0x6F1D2B60, 0xD5A0, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
+@@ -324,11 +326,42 @@ void Device_GetCapabilities(X86 *c) {
+     com_ret(c, DI_OK);
+ }
+ 
++void write_input_object(const ComObj *d, uint32_t out, uint32_t size, const uint8_t *guid,
++                        uint32_t offset, uint32_t type, const char *name) {
++    gm_zero(out, size);
++    wr32(out, size);
++    memcpy(gm_ptr(out + DIDOI_OFF_guidType), guid, 16);
++    wr32(out + DIDOI_OFF_dwOfs, offset);
++    wr32(out + DIDOI_OFF_dwType, type);
++    if (d->di_wide)
++        di_put_wide(out + DIDOI_OFF_tszName, name, DIDOI_NAME_CHARS);
++    else
++        gm_put_str(out + DIDOI_OFF_tszName, name, DIDOI_NAME_CHARS);
++}
++
++void write_keyboard_object(const ComObj *d, uint32_t out, uint32_t size, uint32_t dik,
++                           const char *name) {
++    static const uint8_t GUID_Key_[16] =
++        IID_BYTES(0x55728220, 0xD33C, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
++    write_input_object(d, out, size, GUID_Key_, dik, DIDFT_PSHBUTTON | (dik << 8), name);
++}
++
++JoyObject mouse_object(uint32_t index) {
++    const auto &objects = joy_objects();
++    if (index < 3) {
++        JoyObject axis = objects[index];
++        axis.type = DIDFT_RELAXIS | (index << 8);
++        return axis;
++    }
++    uint32_t button = index - 3;
++    JoyObject object = objects[JOY_AXES + JOY_POVS + button];
++    object.ofs = DIMOFS_BUTTON0 + button;
++    return object;
++}
++
+ // The keyboard lists one push button per key DIPROP_KEYNAME names, at its DIK
+ // offset. A game may size its key table from the highest code it is shown.
+ uint32_t keyboard_enum_objects(X86 *c, ComObj *d, uint32_t cb, uint32_t ref, uint32_t flags) {
+-    static const uint8_t GUID_Key_[16] =
+-        IID_BYTES(0x55728220, 0xD33C, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
+     if (!cb)
+         return DIERR_INVALIDPARAM;
+     uint32_t bits = flags & DIDFT_TYPEMASK;
+@@ -342,34 +375,46 @@ uint32_t keyboard_enum_objects(X86 *c, ComObj *d, uint32_t cb, uint32_t ref, uin
+         uint32_t a = di_scratch(size);
+         if (!a)
+             return E_OUTOFMEMORY;
+-        gm_zero(a, size);
+-        wr32(a, size);
+-        memcpy(gm_ptr(a + DIDOI_OFF_guidType), GUID_Key_, 16);
+-        wr32(a + DIDOI_OFF_dwOfs, dik);
+-        wr32(a + DIDOI_OFF_dwType, DIDFT_PSHBUTTON | (dik << 8));
+-        if (d->di_wide)
+-            di_put_wide(a + DIDOI_OFF_tszName, name.c_str(), DIDOI_NAME_CHARS);
+-        else
+-            gm_put_str(a + DIDOI_OFF_tszName, name.c_str(), DIDOI_NAME_CHARS);
++        write_keyboard_object(d, a, size, dik, name.c_str());
+         if (guest_call(c, cb, a, ref) != 1 /* DIENUM_CONTINUE */)
+             break;
+     }
+     return DI_OK;
+ }
+ 
+-// EnumObjects(callback, ref, dwFlags). The mouse keeps the old silent success.
+ void Device_EnumObjects(X86 *c) {
+     ComObj *d = this_device(c);
+-    if (d && is_joystick(d)) {
+-        com_ret(c, joy_enum_objects(c, d, arg(c, 1), arg(c, 2), arg(c, 3)));
++    uint32_t cb = arg(c, 1), ref = arg(c, 2), flags = arg(c, 3);
++    if (!d || !cb) {
++        com_ret(c, DIERR_INVALIDPARAM);
+         return;
+     }
+-    if (d && d->dev_type == DIDEVTYPE_KEYBOARD) {
+-        com_ret(c, keyboard_enum_objects(c, d, arg(c, 1), arg(c, 2), arg(c, 3)));
++    if (is_joystick(d)) {
++        com_ret(c, joy_enum_objects(c, d, cb, ref, flags));
+         return;
+     }
+-    log_once("dx.Device_EnumObjects",
+-             "dx: Device_EnumObjects on the mouse is not implemented; returning DI_OK");
++    if (d->dev_type == DIDEVTYPE_KEYBOARD) {
++        com_ret(c, keyboard_enum_objects(c, d, cb, ref, flags));
++        return;
++    }
++    if (!(flags & 0x1F000000u)) {
++        uint32_t size = d->di_wide ? DIDEVICEOBJECTINSTANCEW_SIZE : DIDEVICEOBJECTINSTANCEA_SIZE;
++        uint32_t buttons = d->data_format_size == DIMOUSESTATE2_SIZE ? 8 : 4;
++        uint32_t types = flags & DIDFT_TYPEMASK;
++        for (uint32_t index = 0; index < 3 + buttons; ++index) {
++            JoyObject object = mouse_object(index);
++            if (types && !(types & object.type))
++                continue;
++            uint32_t out = di_scratch(size);
++            if (!out) {
++                com_ret(c, E_OUTOFMEMORY);
++                return;
++            }
++            write_input_object(d, out, size, object.guid, object.ofs, object.type, object.name);
++            if (guest_call(c, cb, out, ref) != 1)
++                break;
++        }
++    }
+     com_ret(c, DI_OK);
+ }
+ 
+@@ -706,17 +751,46 @@ void Device_SetCooperativeLevel(X86 *c) {
+ // GetObjectInfo(pdidoi, dwObj, dwHow).
+ void Device_GetObjectInfo(X86 *c) {
+     ComObj *d = this_device(c);
+-    uint32_t out = arg(c, 1);
+-    if (!out || !gm_valid(out, 4)) {
++    uint32_t out = arg(c, 1), object = arg(c, 2), how = arg(c, 3);
++    if (!d || !out || !gm_valid(out, 4)) {
+         com_ret(c, DIERR_INVALIDPARAM);
+         return;
+     }
+-    if (d && is_joystick(d)) {
+-        com_ret(c, joy_get_object_info(d, out, arg(c, 2), arg(c, 3)));
++    if (is_joystick(d)) {
++        com_ret(c, joy_get_object_info(d, out, object, how));
+         return;
+     }
+-    log_once("dinput.objectinfo", "dinput: GetObjectInfo is not supported");
+-    com_ret(c, DIERR_UNSUPPORTED);
++    uint32_t size = rd32(out);
++    bool valid_size =
++        d->di_wide
++            ? size == DIDEVICEOBJECTINSTANCEW_SIZE || size == DIDEVICEOBJECTINSTANCE_DX3W_SIZE
++            : size == DIDEVICEOBJECTINSTANCEA_SIZE || size == DIDEVICEOBJECTINSTANCE_DX3A_SIZE;
++    if (!valid_size || !gm_valid(out, size) || (how != DIPH_BYOFFSET && how != DIPH_BYID)) {
++        com_ret(c, DIERR_INVALIDPARAM);
++        return;
++    }
++    if (d->dev_type == DIDEVTYPE_KEYBOARD) {
++        uint32_t dik = how == DIPH_BYID ? didft_instance(object) : object;
++        const std::string name = dik < 256 ? guest_key_name(dik) : std::string{};
++        if (!name.empty() &&
++            (how == DIPH_BYOFFSET || (object & DIDFT_TYPEMASK) == DIDFT_PSHBUTTON)) {
++            write_keyboard_object(d, out, size, dik, name.c_str());
++            com_ret(c, DI_OK);
++            return;
++        }
++    } else if (d->dev_type == DIDEVTYPE_MOUSE) {
++        uint32_t buttons = d->data_format_size == DIMOUSESTATE2_SIZE ? 8 : 4;
++        for (uint32_t index = 0; index < 3 + buttons; ++index) {
++            JoyObject candidate = mouse_object(index);
++            if (object == (how == DIPH_BYOFFSET ? candidate.ofs : candidate.type)) {
++                write_input_object(d, out, size, candidate.guid, candidate.ofs, candidate.type,
++                                   candidate.name);
++                com_ret(c, DI_OK);
++                return;
++            }
++        }
++    }
++    com_ret(c, DIERR_OBJECTNOTFOUND);
+ }
+ 
+ void Device_GetDeviceInfo(X86 *c) {
+@@ -1167,6 +1241,7 @@ void direct_input_create(X86 *c, uint32_t version, uint32_t out, uint32_t outer,
+ 
+ void DirectInput8Create(X86 *c) {
+     uint32_t version = arg(c, 1);
++    uint32_t riid = arg(c, 2);
+     uint32_t out = arg(c, 3);
+     uint32_t outer = arg(c, 4);
+     if (!out || !gm_valid(out, 4)) {
+@@ -1183,6 +1258,8 @@ void DirectInput8Create(X86 *c) {
+     // type codes, so the object remembers at least version 8 whatever number
+     // it was handed. Nothing else reads di_version.
+     di->di_version = version < DIRECTINPUT_VERSION_8 ? DIRECTINPUT_VERSION_8 : version;
++    di->di_wide = riid && gm_valid(riid, sizeof IID_IDirectInput8W_) &&
++                  memcmp(gm_ptr(riid), IID_IDirectInput8W_, sizeof IID_IDirectInput8W_) == 0;
+     uint32_t view = com_view(di, IF_DINPUT8);
+     if (!view) {
+         com_release(di);
+diff --git a/dx/dsound.cpp b/dx/dsound.cpp
+index 4334f1d4..36fdfdea 100644
+--- a/dx/dsound.cpp
++++ b/dx/dsound.cpp
+@@ -53,7 +53,7 @@ static const uint8_t GUID_RecompPlayback_[16] =
+ static const uint8_t IID_IDirectSound_[16] =
+     IID_BYTES(0x279AFA83, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
+ static const uint8_t IID_IDirectSound8_[16] =
+-    IID_BYTES(0xC50A7E93, 0xF395, 0x4834, 0x9E, 0xF6, 0x7F, 0xA9, 0x9D, 0xE5, 0x09, 0xE6);
++    IID_BYTES(0xC50A7E93, 0xF395, 0x4834, 0x9E, 0xF6, 0x7F, 0xA9, 0x9D, 0xE5, 0x09, 0x66);
+ static const uint8_t IID_IDirectSoundBuffer_[16] =
+     IID_BYTES(0x279AFA85, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
+ static const uint8_t IID_IDirectSoundBuffer8_[16] =
+@@ -2353,6 +2353,8 @@ const ImportShim g_dsound_exports[] = {
+     {"DSOUND.dll", "DirectSoundCreate8", 3, DirectSoundCreate8},
+     {"DSOUND.dll", "ord6", 3, DirectSoundCaptureCreate},
+     {"DSOUND.dll", "DirectSoundCaptureCreate", 3, DirectSoundCaptureCreate},
++    {"DSOUND.dll", "ord12", 3, DirectSoundCaptureCreate},
++    {"DSOUND.dll", "DirectSoundCaptureCreate8", 3, DirectSoundCaptureCreate},
+     {"DSOUND.dll", "ord7", 2, DirectSoundCaptureEnumerateA},
+     {"DSOUND.dll", "DirectSoundCaptureEnumerateA", 2, DirectSoundCaptureEnumerateA},
+     {"DSOUND.dll", "ord9", 2, DirectSoundGetDeviceID},
+diff --git a/graphics/compositor/src/surface.rs b/graphics/compositor/src/surface.rs
+index d5797663..9b406e00 100644
+--- a/graphics/compositor/src/surface.rs
++++ b/graphics/compositor/src/surface.rs
+@@ -47,12 +47,13 @@ impl SurfacePresenter {
+             return Err("surface: adapter does not support drawable copy destinations".into());
+         }
+         config.usage = usage;
+-        config.format = caps
+-            .formats
+-            .iter()
+-            .copied()
+-            .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
+-            .unwrap_or(config.format);
++        config.format = [
++            wgpu::TextureFormat::Bgra8Unorm,
++            wgpu::TextureFormat::Rgba8Unorm,
++        ]
++        .into_iter()
++        .find(|format| caps.formats.contains(format))
++        .unwrap_or(config.format);
+         if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+             config.present_mode = wgpu::PresentMode::Fifo;
+         }
+diff --git a/graphics/d3d8-wgpu/Cargo.toml b/graphics/d3d8-wgpu/Cargo.toml
+index 185362a2..60cef1d2 100644
+--- a/graphics/d3d8-wgpu/Cargo.toml
++++ b/graphics/d3d8-wgpu/Cargo.toml
+@@ -47,7 +47,7 @@ pollster.workspace = true
+ raw-window-handle = "0.6"
+ recomp-gpu = { path = "../gpu" }
+ recomp-compositor = { path = "../compositor", default-features = false, features = ["gpu"] }
+-smallvec = { version = "1", features = ["union"] }
++smallvec = { version = "1", features = ["const_generics", "union"] }
+ texpresso = "2"
+ wgpu.workspace = true
+ winit = { version = "0.30", optional = true }
+diff --git a/graphics/d3d8-wgpu/consumer/src/bin/d3d9-gpu-consumer.rs b/graphics/d3d8-wgpu/consumer/src/bin/d3d9-gpu-consumer.rs
+index c093ff1c..a3947a2e 100644
+--- a/graphics/d3d8-wgpu/consumer/src/bin/d3d9-gpu-consumer.rs
++++ b/graphics/d3d8-wgpu/consumer/src/bin/d3d9-gpu-consumer.rs
+@@ -333,6 +333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         adapter: 0,
+         device_type: 1,
+         behavior_flags: 0x40,
++        full_detail_mips: false,
+         present,
+         display_mode: DisplayMode::default(),
+     };
+diff --git a/graphics/d3d8-wgpu/consumer/src/main.rs b/graphics/d3d8-wgpu/consumer/src/main.rs
+index 654f124a..60f6e4cc 100644
+--- a/graphics/d3d8-wgpu/consumer/src/main.rs
++++ b/graphics/d3d8-wgpu/consumer/src/main.rs
+@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         adapter: 1,
+         device_type: 0,
+         behavior_flags: 0,
++        full_detail_mips: false,
+         present,
+         display_mode: DisplayMode::default(),
+     })
+diff --git a/graphics/d3d8-wgpu/src/backend/mod.rs b/graphics/d3d8-wgpu/src/backend/mod.rs
+index 8202cf6d..19ad4dfa 100644
+--- a/graphics/d3d8-wgpu/src/backend/mod.rs
++++ b/graphics/d3d8-wgpu/src/backend/mod.rs
+@@ -119,6 +119,7 @@ pub struct GpuContext {
+     pub(crate) d3d9_pending:
+         std::sync::OnceLock<Arc<std::sync::Mutex<crate::d3d9::gpu::PendingWork>>>,
+     shared: Arc<recomp_gpu::SharedContext>,
++    pub(crate) d3d9_driver_cache: Option<Arc<crate::d3d9::gpu::DriverPipelineCache>>,
+     /// Present surface, or `None` for a headless context.
+     surface: Option<wgpu::Surface<'static>>,
+     /// Window backing `surface`, kept so `present` can size the swapchain to the
+@@ -266,6 +267,7 @@ impl GpuContext {
+         );
+         Ok(Self {
+             d3d9_pending: Default::default(),
++            d3d9_driver_cache: None,
+             shared,
+             surface: None,
+             #[cfg(feature = "windowing")]
+@@ -366,7 +368,17 @@ impl GpuContext {
+         // Optional features are intersected with the adapter. A guest that
+         // selects a feature the adapter lacks fails with a named error later
+         // instead of stopping the whole device from opening.
+-        let required_features = adapter.features() & requested_features;
++        let cache_path = if cfg!(target_os = "android")
++            && adapter.features().contains(wgpu::Features::PIPELINE_CACHE)
++        {
++            std::env::var_os("RECOMP_D3D9_PIPELINE_CACHE").map(std::path::PathBuf::from)
++        } else {
++            None
++        };
++        let mut required_features = adapter.features() & requested_features;
++        if cache_path.is_some() {
++            required_features |= wgpu::Features::PIPELINE_CACHE;
++        }
+         let (device, queue) = adapter
+             .request_device(&wgpu::DeviceDescriptor {
+                 label: Some("d3d8-wgpu"),
+@@ -392,6 +404,8 @@ impl GpuContext {
+             adapter_info.device
+         );
+ 
++        let d3d9_driver_cache = cache_path
++            .map(|path| Arc::new(crate::d3d9::gpu::DriverPipelineCache::open(&device, path)));
+         let shared = Arc::new(
+             recomp_gpu::SharedContext::new(adapter, device, queue)
+                 .map_err(|message| RenderError::invalid("GpuContext", message))?,
+@@ -404,6 +418,7 @@ impl GpuContext {
+             });
+         Ok(Self {
+             d3d9_pending: Default::default(),
++            d3d9_driver_cache,
+             shared,
+             surface,
+             #[cfg(feature = "windowing")]
+diff --git a/graphics/d3d8-wgpu/src/bridge.rs b/graphics/d3d8-wgpu/src/bridge.rs
+index 64e50ea3..26ac26dd 100644
+--- a/graphics/d3d8-wgpu/src/bridge.rs
++++ b/graphics/d3d8-wgpu/src/bridge.rs
+@@ -218,6 +218,7 @@ pub mod ffi {
+         adapter: u32,
+         device_type: u32,
+         behavior_flags: u32,
++        full_detail_mips: bool,
+         present: D3d9PresentParams,
+         display_mode: D3d9DisplayMode,
+     }
+@@ -244,6 +245,7 @@ pub mod ffi {
+         display_mode: D3d9DisplayMode,
+         implicit_external_refs: bool,
+         window_valid: bool,
++        binding_only_resources: Vec<u32>,
+     }
+ 
+     struct D3d9ResetResult {
+diff --git a/graphics/d3d8-wgpu/src/d3d9.rs b/graphics/d3d8-wgpu/src/d3d9.rs
+index 3a2152e9..0ff3ad38 100644
+--- a/graphics/d3d8-wgpu/src/d3d9.rs
++++ b/graphics/d3d8-wgpu/src/d3d9.rs
+@@ -112,7 +112,8 @@ const D3DSWAPEFFECT_DISCARD: u32 = 1;
+ const D3DSWAPEFFECT_FLIP: u32 = 2;
+ const D3DSWAPEFFECT_COPY: u32 = 3;
+ 
+-const D3DPRESENTFLAG_KNOWN: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010;
++const D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL: u32 = 0x0000_0002;
++const D3DPRESENTFLAG_KNOWN: u32 = 0x0000_0001 | D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL | 0x0000_0004 | 0x0000_0010;
+ 
+ const D3DPRESENT_INTERVAL_DEFAULT: u32 = 0x0000_0000;
+ const D3DPRESENT_INTERVAL_ONE: u32 = 0x0000_0001;
+@@ -407,6 +408,7 @@ pub struct DeviceRequest {
+     pub adapter: u32,
+     pub device_type: u32,
+     pub behavior_flags: u32,
++    pub full_detail_mips: bool,
+     pub present: PresentParams,
+     pub display_mode: DisplayMode,
+ }
+@@ -1481,10 +1483,11 @@ fn validate_present_params(
+             format!("unknown D3DPRESENTFLAG(s) {unknown_flags:#x}"),
+         ));
+     }
+-    if present.flags != 0 {
++    let unsupported_flags = present.flags & !D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL;
++    if unsupported_flags != 0 {
+         return Err(RenderError::new(
+             "D3DPRESENT_PARAMETERS",
+-            format!("D3DPRESENTFLAG(s) {:#x} are not implemented", present.flags),
++            format!("D3DPRESENTFLAG(s) {unsupported_flags:#x} are not implemented"),
+         ));
+     }
+     if present.enable_auto_depth_stencil != 0 {
+@@ -1610,6 +1613,7 @@ pub fn d3d9_create_device(
+         adapter: request.adapter,
+         device_type: request.device_type,
+         behavior_flags: request.behavior_flags,
++        full_detail_mips: request.full_detail_mips,
+         present: request.present.into(),
+         display_mode: request.display_mode.into(),
+     };
+@@ -1768,6 +1772,7 @@ fn create_device(
+     device.features = gpu.device.features();
+     device.limits = gpu.device.limits();
+     let mut d3d9_gpu = D3d9Gpu::from_context_with_loss(&gpu, loss.as_ref().clone());
++    d3d9_gpu.full_detail_mips = request.full_detail_mips;
+     d3d9_gpu.shader_mode = config.shader_mode.clone();
+     d3d9_gpu.shader_mode_error = config.shader_mode_error.clone();
+     d3d9_gpu.tint = config.tint;
+@@ -2088,8 +2093,11 @@ fn reset_validation(
+     }
+     if device
+         .resources
+-        .values()
+-        .any(|registration| registration.pool == resource::D3DPOOL_DEFAULT)
++        .iter()
++        .any(|(id, registration)| {
++            registration.pool == resource::D3DPOOL_DEFAULT
++                && !request.binding_only_resources.contains(id)
++        })
+     {
+         return Err(status(
+             StatusCode::InvalidArgument,
+@@ -2179,6 +2187,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
+     let expected: BTreeMap<u32, u32> = device
+         .resources
+         .iter()
++        .filter(|(id, _)| !request.binding_only_resources.contains(id))
+         .map(|(id, registration)| (*id, registration.pool))
+         .collect();
+     if physical {
+@@ -2207,6 +2216,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
+             d3d9_gpu.shader_mode = previous.shader_mode.clone();
+             d3d9_gpu.shader_mode_error = previous.shader_mode_error.clone();
+             d3d9_gpu.tint = previous.tint;
++            d3d9_gpu.full_detail_mips = previous.full_detail_mips;
+         }
+         if let Err(error) = draw::uber::prepare(&d3d9_gpu) {
+             device.replacement = Some((gpu, loss));
+diff --git a/graphics/d3d8-wgpu/src/d3d9/api.rs b/graphics/d3d8-wgpu/src/d3d9/api.rs
+index b95e36bb..41417773 100644
+--- a/graphics/d3d8-wgpu/src/d3d9/api.rs
++++ b/graphics/d3d8-wgpu/src/d3d9/api.rs
+@@ -663,6 +663,7 @@ impl Device {
+                 display_mode: display_mode.into(),
+                 implicit_external_refs: false,
+                 window_valid: true,
++                binding_only_resources: Vec::new(),
+             },
+         );
+         check(result.status)?;
+diff --git a/graphics/d3d8-wgpu/src/d3d9/draw.rs b/graphics/d3d8-wgpu/src/d3d9/draw.rs
+index 511d3f8f..a5a7f7b4 100644
+--- a/graphics/d3d8-wgpu/src/d3d9/draw.rs
++++ b/graphics/d3d8-wgpu/src/d3d9/draw.rs
+@@ -543,18 +543,6 @@ fn append_f32_le(out: &mut Vec<u8>, values: &[f32]) {
+     }
+ }
+ 
+-fn append_u32_le(out: &mut Vec<u8>, values: &[u32]) {
+-    if cfg!(target_endian = "little") {
+-        out.extend_from_slice(bytemuck::cast_slice(values));
+-    } else {
+-        let start = out.len();
+-        out.resize(start + values.len() * 4, 0);
+-        for (destination, value) in out[start..].chunks_exact_mut(4).zip(values) {
+-            destination.copy_from_slice(&value.to_le_bytes());
+-        }
+-    }
+-}
+-
+ fn flat_to_u8(values: &[f32]) -> Vec<u8> {
+     let mut out = Vec::with_capacity(values.len().saturating_mul(4));
+     append_f32_le(&mut out, values);
+@@ -1105,26 +1093,24 @@ fn ff_op(op: u32, a: &str, b: &str, c: &str) -> Result<String, RenderError> {
+         }
+     })
+ }
++fn ff_stages<'a>(
++    state: &'a D3d9State,
++    textures: &'a [BoundTexture],
++) -> impl Iterator<Item = (u32, Option<&'a BoundTexture>)> {
++    (0..8)
++        .map(move |stage| (stage, textures.iter().find(|t| t.stage == stage)))
++        .take_while(move |&(stage, bound)| {
++            tss(state, stage, 1) != 1 && (bound.is_some() || tss(state, stage, 2) & 15 != 2)
++        })
++}
++
+ fn ff_fragment_source(state: &D3d9State, textures: &[BoundTexture]) -> Result<String, RenderError> {
+     let mut source = String::from(V2F);
+     source += &shader_interface::pixel_parameters(false);
+-    source += "@group(0) @binding(3) var<uniform> psp:PSP;\n";
+-    let mut body = format!(
+-        "var current=vin.d0;var temp=vec4<f32>(0.0);let tfactor=vec4<f32>({},{},{},{});\n",
+-        color(rs(state, 60))[0],
+-        color(rs(state, 60))[1],
+-        color(rs(state, 60))[2],
+-        color(rs(state, 60))[3]
+-    );
+-    for stage in 0..8 {
++    source += "@group(0) @binding(2) var<uniform> tfactor:vec4<f32>;\n@group(0) @binding(3) var<uniform> psp:PSP;\n";
++    let mut body = String::from("var current=vin.d0;var temp=vec4<f32>(0.0);\n");
++    for (stage, bound) in ff_stages(state, textures) {
+         let op = tss(state, stage, 1);
+-        if op == 1 {
+-            break;
+-        }
+-        let bound = textures.iter().find(|t| t.stage == stage);
+-        if bound.is_none() && tss(state, stage, 2) & 15 == 2 {
+-            break;
+-        }
+         let alpha_op = tss(state, stage, 4);
+         if alpha_op == 1 {
+             return Err(unsupported(
+@@ -1164,10 +1150,7 @@ fn ff_fragment_source(state: &D3d9State, textures: &[BoundTexture]) -> Result<St
+             tss(state, stage, 6),
+             tss(state, stage, 27),
+         );
+-        let texture = textures
+-            .iter()
+-            .find(|t| t.stage == stage)
+-            .filter(|_| needs_texture);
++        let texture = bound.filter(|_| needs_texture);
+         if needs_texture && texture.is_none() {
+             return Err(unsupported(
+                 "Draw",
+@@ -1217,8 +1200,10 @@ fn ff_fragment_source(state: &D3d9State, textures: &[BoundTexture]) -> Result<St
+                 coord = format!("({coord}/{coord}.{component})");
+             }
+             let sample = format!(
+-                "textureSample(tx{stage},sm{stage},({coord}).{})",
+-                if t.cube || t.volume { "xyz" } else { "xy" }
++                "textureSampleBias(tx{stage},sm{stage},({coord}).{},psp.lod_bias[{}][{}])",
++                if t.cube || t.volume { "xyz" } else { "xy" },
++                stage / 4,
++                stage % 4
+             );
+             body += &format!(
+                 "let tex={};\n",
+@@ -1289,6 +1274,7 @@ fn stencil_op(value: u32) -> wgpu::StencilOperation {
+ fn depth_state(
+     state: &D3d9State,
+     depth: Option<&SurfaceView>,
++    topology: wgpu::PrimitiveTopology,
+ ) -> Result<Option<wgpu::DepthStencilState>, RenderError> {
+     let Some(depth) = depth else {
+         return Ok(None);
+@@ -1322,15 +1308,31 @@ fn depth_state(
+     } else {
+         wgpu::StencilState::default()
+     };
+-    let bias = f32::from_bits(rs(state, 195));
+-    if bias != 0.0 {
+-        return Err(unsupported(
+-            "Draw",
+-            "constant depth bias conversion is deferred",
+-        ));
+-    }
++    let format = depth.texture.format();
++    // D3D9 applies depth bias only to triangles, including wireframe triangles.
++    let bias = if matches!(
++        topology,
++        wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
++    ) {
++        // Convert normalized D3D9 depth to WebGPU depth units. Floating-point
++        // units vary with the primitive, so use the spacing just below 1.0.
++        let depth_units = match format {
++            wgpu::TextureFormat::Depth16Unorm => 65_535.0,
++            wgpu::TextureFormat::Depth24Plus | wgpu::TextureFormat::Depth24PlusStencil8 => {
++                16_777_215.0
++            }
++            _ => 16_777_216.0,
++        };
++        wgpu::DepthBiasState {
++            constant: (f64::from(f32::from_bits(rs(state, 195))) * depth_units).round() as i32,
++            slope_scale: f32::from_bits(rs(state, 175)),
++            clamp: 0.0,
++        }
++    } else {
++        wgpu::DepthBiasState::default()
++    };
+     Ok(Some(wgpu::DepthStencilState {
+-        format: depth.texture.format(),
++        format,
+         depth_write_enabled: Some(rs(state, 7) != 0 && rs(state, 14) != 0),
+         depth_compare: Some(if rs(state, 7) != 0 {
+             compare(rs(state, 23))
+@@ -1338,11 +1340,7 @@ fn depth_state(
+             wgpu::CompareFunction::Always
+         }),
+         stencil,
+-        bias: wgpu::DepthBiasState {
+-            constant: 0,
+-            slope_scale: f32::from_bits(rs(state, 175)),
+-            clamp: 0.0,
+-        },
++        bias,
+     }))
+ }
+ fn blend_factor(v: u32, alpha: bool) -> Result<wgpu::BlendFactor, RenderError> {
+@@ -1489,17 +1487,15 @@ fn sampler(
+             }
+         })
+     };
+-    if ss(state, t.stage, 8) != 0 {
+-        return Err(unsupported("Draw", "sampler LOD bias is not implemented"));
+-    }
+     if ss(state, t.stage, 11) != 0 {
+         return Err(unsupported(
+             "Draw",
+             "sRGB texture sampling views are not implemented",
+         ));
+     }
++    let resource_lod = if gpu.full_detail_mips { 0 } else { t.lod };
+     let lod_min = ss(state, t.stage, 9)
+-        .max(t.lod)
++        .max(resource_lod)
+         .min(t.levels.saturating_sub(1)) as f32;
+     let lod_max = if ss(state, t.stage, 7) == 0 {
+         lod_min
+@@ -2037,6 +2033,9 @@ impl D3d9DrawState {
+     pub(crate) fn end_frame(&mut self, gpu: &D3d9Gpu) {
+         stats::end_frame();
+         self.memo_capture.end_frame(self.frame);
++        if let Some(cache) = &gpu.driver_cache {
++            cache.end_frame(self.pipeline_ms != 0.0);
++        }
+         if uber::hybrid(gpu) {
+             if let Some(compiler) = &mut self.compiler {
+                 compiler.end_frame(self.frame);
+@@ -2362,7 +2361,11 @@ impl D3d9DrawState {
+     ) -> wgpu::RenderPipeline {
+         let pipeline = recipe
+             .prepare(key.modules.clone(), key.layout.clone())
+-            .create(&gpu.device, "d3d9-cached");
++            .create(
++                &gpu.device,
++                "d3d9-cached",
++                gpu.driver_cache.as_ref().map(|cache| &cache.handle),
++            );
+         self.cache_pipeline(
+             recipe,
+             CompiledPipeline {
+@@ -2504,35 +2507,33 @@ fn fixed_function_key(
+     state: &D3d9State,
+     textures: &[BoundTexture],
+ ) -> ShaderVariantKey {
+-    let head = [rs(state, 9), rs(state, 29), rs(state, 60)];
+     if !pixel {
+         return ShaderVariantKey {
+             pixel,
+             shader: ShaderOrigin::FixedFunction,
+-            state: KeyWords::from_slice(&head),
++            state: KeyWords::from_slice(&[rs(state, 9)]),
+         };
+     }
+-    let mut values = Vec::with_capacity(92 + textures.len() * 5);
+-    values.extend_from_slice(&head);
+-    values.push(u32::from(state.shader(false) != 0));
+-    for stage in 0..8 {
++    let mut values: SmallVec<[u32; 52]> = smallvec![
++        rs(state, 9),
++        u32::from(rs(state, 29) != 0),
++        u32::from(state.shader(false) != 0),
++    ];
++    for (stage, texture) in ff_stages(state, textures) {
+         for id in [1, 2, 3, 4, 5, 6, 24, 26, 27, 28, 32] {
+             values.push(tss(state, stage, id));
+         }
+-    }
+-    for texture in textures {
+-        values.extend_from_slice(&[
+-            texture.stage,
+-            texture.format,
+-            texture.depth as u32,
+-            texture.cube as u32,
+-            texture.volume as u32,
+-        ]);
++        values.push(texture.map_or(0, |texture| {
++            1 | (u32::from(opaque_format(texture.format)) << 1)
++                | (u32::from(texture.depth) << 2)
++                | (u32::from(texture.cube) << 3)
++                | (u32::from(texture.volume) << 4)
++        }));
+     }
+     ShaderVariantKey {
+         pixel,
+         shader: ShaderOrigin::FixedFunction,
+-        state: KeyWords::Heap(values),
++        state: KeyWords::from_slice(&values),
+     }
+ }
+ 
+@@ -2773,6 +2774,7 @@ fn pipeline_descriptor(
+         blend: blend_state(state, opaque_format(snapshot.target.format))?,
+         write_mask: wgpu::ColorWrites::from_bits_truncate(rs(state, 168)),
+     };
++    let depth = depth_state(state, snapshot.depth.as_ref(), topology)?;
+     Ok(PipelineDescriptor {
+         entry_points: ["vs_main", "ps_main"],
+         target: Some(target),
+@@ -2784,7 +2786,7 @@ fn pipeline_descriptor(
+             polygon_mode: fill_mode(gpu, state)?,
+             ..Default::default()
+         },
+-        depth: depth_state(state, snapshot.depth.as_ref())?,
++        depth,
+         multisample: wgpu::MultisampleState {
+             mask: u64::from(rs(state, 162)),
+             ..Default::default()
+@@ -3243,7 +3245,7 @@ pub(crate) fn execute(
+                 tss(state, texture.stage, 6)
+             );
+             eprintln!(
+-                "[d3d9-trace] stage={} coord_index={:#x} transform_flags={:#x} matrix={:?} address={:?}",
++                "[d3d9-trace] stage={} coord_index={:#x} transform_flags={:#x} matrix={:?} address={:?} filters={:?} max_mip={} lod_bias={}",
+                 texture.stage,
+                 tss(state, texture.stage, 11),
+                 tss(state, texture.stage, 24),
+@@ -3252,7 +3254,10 @@ pub(crate) fn execute(
+                     ss(state, texture.stage, 1),
+                     ss(state, texture.stage, 2),
+                     ss(state, texture.stage, 3)
+-                ]
++                ],
++                [5, 6, 7].map(|id| ss(state, texture.stage, id)),
++                ss(state, texture.stage, 9),
++                f32::from_bits(ss(state, texture.stage, 8)),
+             );
+         }
+         eprintln!(
+@@ -3401,30 +3406,35 @@ pub(crate) fn execute(
+         [1.0 / vp.width as f32, -1.0 / vp.height as f32, 0.0, 0.0],
+         psp_words,
+     );
++    let lod_bias = |stage| {
++        let bias = ss(state, stage, 8);
++        if gpu.full_detail_mips && f32::from_bits(bias) > 0.0 {
++            0
++        } else {
++            bias
++        }
++    };
+     if interpreted {
+-        let (opaque, unbound) = ps
++        let mapping = &ps
+             .unwrap()
+             .interpreter
+             .as_ref()
+             .map_err(|why| unsupported("InterpreterDraw", why.to_string()))?
+-            .sampler_mapping
+-            .iter()
+-            .copied()
+-            .fold(
+-                (0, 0),
+-                |(opaque, unbound), (guest, physical)| match snapshot
+-                    .textures
+-                    .iter()
+-                    .find(|t| t.stage == guest)
+-                {
+-                    Some(texture) => (
+-                        opaque | (u32::from(opaque_format(texture.format)) << physical),
+-                        unbound,
+-                    ),
+-                    None => (opaque, unbound | (1 << physical)),
+-                },
+-            );
++            .sampler_mapping;
++        let (mut opaque, mut unbound) = (0, 0);
++        for &(guest, physical) in mapping {
++            if let Some(texture) = snapshot.textures.iter().find(|t| t.stage == guest) {
++                opaque |= u32::from(opaque_format(texture.format)) << physical;
++                parameters.sampler_lod_bias(physical, lod_bias(guest));
++            } else {
++                unbound |= 1 << physical;
++            }
++        }
+         parameters.interpreter_flags(opaque, unbound, uber::tint_enabled(gpu));
++    } else {
++        for texture in &snapshot.textures {
++            parameters.sampler_lod_bias(texture.stage, lod_bias(texture.stage));
++        }
+     }
+     let has_attributes = !vertices.attributes.is_empty();
+     let buffers = match native_geometry.as_ref() {
+@@ -3536,13 +3546,20 @@ pub(crate) fn execute(
+     {
+         flush(gpu, draw, queries)?;
+     }
++    // Fixed-function draws use the pixel constant slot for D3DRS_TEXTUREFACTOR.
++    let texture_factor = color(rs(state, 60)).map(f32::to_le_bytes);
++    let pixel_constants = if ps.is_some() {
++        state.constants_f_bytes(true, memo.ps_count)?
++    } else {
++        texture_factor.as_flattened()
++    };
+     let uniform_values = parameters.values(
+         if ff_key.is_some() {
+             bytemuck::cast_slice(&ff_uniforms)
+         } else {
+             state.constants_f_bytes(false, memo.vs_count)?
+         },
+-        state.constants_f_bytes(true, memo.ps_count)?,
++        pixel_constants,
+     );
+     if interpreted {
+         draw.interpreter_frame.uniform_bytes += uniform_values
+@@ -3557,7 +3574,7 @@ pub(crate) fn execute(
+             memo.vs_count,
+             memo.ps_count,
+             uniform_values.map(|v| self::fingerprint(&v)),
+-            depth_state(state, snapshot.depth.as_ref())?,
++            depth_state(state, snapshot.depth.as_ref(), topology)?,
+             blend_state(state, opaque_format(snapshot.target.format))?,
+             self::fingerprint(&vertices.bytes)
+         );
+@@ -4031,7 +4048,6 @@ fn flush_inner(
+         .map(|pending| u64::from(pending.viewport.width) * u64::from(pending.viewport.height))
+         .max()
+         .unwrap_or(0);
+-    let segment = queries.open_segment(area)?;
+     let needed = draw.batch.data.len().max(4) as u64;
+     if needed > gpu.limits().max_buffer_size || needed > u32::MAX as u64 {
+         return Err(RenderError::out_of_memory(
+@@ -4039,6 +4055,7 @@ fn flush_inner(
+             "draw upload exceeds the device buffer limit",
+         ));
+     }
++    let segment = queries.open_segment(gpu, area)?;
+     let recorder = Arc::clone(&draw.recorder);
+     let mut spare = recorder
+         .try_lock()
+diff --git a/graphics/d3d8-wgpu/src/d3d9/gpu.rs b/graphics/d3d8-wgpu/src/d3d9/gpu.rs
+index f8c43d44..cc4939f7 100644
+--- a/graphics/d3d8-wgpu/src/d3d9/gpu.rs
++++ b/graphics/d3d8-wgpu/src/d3d9/gpu.rs
+@@ -348,13 +348,69 @@ impl Drop for PendingWork {
+     }
+ }
+ 
++pub(crate) struct DriverPipelineCache {
++    pub(crate) handle: wgpu::PipelineCache,
++    path: std::path::PathBuf,
++    state: Mutex<(std::time::Instant, bool)>,
++}
++
++impl DriverPipelineCache {
++    const MAX_BYTES: u64 = 32 * 1024 * 1024;
++
++    pub(crate) fn open(device: &wgpu::Device, path: std::path::PathBuf) -> Self {
++        let data = std::fs::metadata(&path)
++            .ok()
++            .filter(|metadata| metadata.len() <= Self::MAX_BYTES)
++            .and_then(|_| std::fs::read(&path).ok());
++        // The Android host supplies the application's private directory.
++        // Its only writer stores bytes returned by this cache API.
++        let handle = unsafe {
++            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
++                label: Some("D3D9 driver pipeline cache"),
++                data: data.as_deref(),
++                fallback: true,
++            })
++        };
++        eprintln!("[d3d9] driver pipeline cache loaded {} bytes", data.as_ref().map_or(0, Vec::len));
++        Self {
++            handle,
++            path,
++            state: Mutex::new((std::time::Instant::now(), false)),
++        }
++    }
++
++    pub(crate) fn end_frame(&self, compiled_pipelines: bool) {
++        let mut state = self.state.lock().unwrap();
++        state.1 |= compiled_pipelines;
++        if !state.1 || state.0.elapsed() < std::time::Duration::from_secs(10) {
++            return;
++        }
++        state.0 = std::time::Instant::now();
++        let Some(data) = self.handle.get_data() else {
++            return;
++        };
++        if data.len() as u64 > Self::MAX_BYTES {
++            return;
++        }
++        let temporary = self.path.with_extension("tmp");
++        match std::fs::write(&temporary, &data)
++            .and_then(|_| std::fs::rename(&temporary, &self.path))
++        {
++            Ok(()) => state.1 = false,
++            Err(error) => eprintln!("[d3d9] could not save driver pipeline cache: {error}"),
++        }
++    }
++}
++
+ pub struct D3d9Gpu {
+     pub device: wgpu::Device,
++    pub(crate) driver_cache: Option<Arc<DriverPipelineCache>>,
+     limits: Arc<wgpu::Limits>,
+     pub(crate) backend: wgpu::Backend,
+     pub(crate) shader_mode: Option<String>,
+     pub(crate) shader_mode_error: Option<String>,
+     pub(crate) tint: bool,
++    pub(crate) full_detail_mips: bool,
+     pub(crate) interpreter:
+         Arc<std::sync::OnceLock<crate::render::interpreter::PreparedInterpreter>>,
+     queue: wgpu::Queue,
+@@ -368,11 +424,13 @@ impl Clone for D3d9Gpu {
+     fn clone(&self) -> Self {
+         Self {
+             device: self.device.clone(),
++            driver_cache: self.driver_cache.clone(),
+             limits: Arc::clone(&self.limits),
+             backend: self.backend,
+             shader_mode: self.shader_mode.clone(),
+             shader_mode_error: self.shader_mode_error.clone(),
+             tint: self.tint,
++            full_detail_mips: self.full_detail_mips,
+             interpreter: Arc::clone(&self.interpreter),
+             queue: self.queue.clone(),
+             pending: Arc::clone(&self.pending),
+@@ -413,11 +471,13 @@ impl D3d9Gpu {
+     pub(crate) fn from_context_with_loss(gpu: &GpuContext, loss: D3d9Loss) -> Self {
+         Self {
+             device: gpu.device.clone(),
++            driver_cache: gpu.d3d9_driver_cache.clone(),
+             limits: Arc::new(gpu.device.limits()),
+             backend: gpu.adapter_info.backend,
+             shader_mode: None,
+             shader_mode_error: None,
+             tint: false,
++            full_detail_mips: false,
+             interpreter: Arc::new(std::sync::OnceLock::new()),
+             queue: gpu.queue.clone(),
+             pending: pending_work(gpu),
+diff --git a/graphics/d3d8-wgpu/src/d3d9/query.rs b/graphics/d3d8-wgpu/src/d3d9/query.rs
+index 6e17f888..b65bca19 100644
+--- a/graphics/d3d8-wgpu/src/d3d9/query.rs
++++ b/graphics/d3d8-wgpu/src/d3d9/query.rs
+@@ -43,16 +43,17 @@ impl Readback {
+                 }
+             })
+             .sum();
+-        drop(data);
+-        self.buffer.unmap();
+         Ok(total.min(u64::from(u32::MAX)) as u32)
+     }
+ }
+ 
+ enum Occlusion {
+     Idle,
+-    Recording(Vec<u64>),
+-    Pending(Readback),
++    Recording {
++        areas: Vec<u64>,
++        chunks: Vec<Readback>,
++    },
++    Pending(Vec<Readback>),
+     Done(u32),
+ }
+ 
+@@ -67,23 +68,53 @@ struct QueryRecord {
+ struct OcclusionPool {
+     set: wgpu::QuerySet,
+     boolean: bool,
+-    next: u32,
+-    outstanding: u32,
+     active: Option<u32>,
+ }
+ 
+ impl OcclusionPool {
+-    fn release(&mut self, occlusion: &Occlusion) {
+-        if matches!(occlusion, Occlusion::Pending(_)) {
+-            self.outstanding -= 1;
+-        }
+-        self.retire();
+-    }
+-
+-    fn retire(&mut self) {
+-        if self.outstanding == 0 && self.active.is_none() {
+-            self.next = 0;
+-        }
++    // The resolve and copy are queued before subsequent draws. The guest can
++    // keep the result buffer alive without holding any slots in the query set.
++    fn resolve(&self, gpu: &D3d9Gpu, areas: &mut Vec<u64>) -> Result<Readback, RenderError> {
++        let count = areas.len() as u32;
++        let size = u64::from(count) * OCCLUSION_STRIDE;
++        let readback = gpu.validate("ResolveOcclusion", || {
++            let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("d3d9-occlusion-resolve"),
++                size,
++                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
++                mapped_at_creation: false,
++            });
++            let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("d3d9-occlusion-readback"),
++                size,
++                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            gpu.record(|encoder, _| {
++                encoder.resolve_query_set(&self.set, 0..count, &resolve, 0);
++                encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
++            });
++            Ok(readback)
++        })?;
++        let mapped = Arc::new(OnceLock::new());
++        let map_target = readback.clone();
++        let flag = Arc::clone(&mapped);
++        let physical = gpu.loss().physical_loss();
++        gpu.submit_then(move |_| {
++            if physical.is_lost() {
++                let _ = flag.set(false);
++                return;
++            }
++            map_target.map_async(wgpu::MapMode::Read, .., move |result| {
++                let _ = flag.set(result.is_ok());
++            });
++        });
++        Ok(Readback {
++            buffer: readback,
++            mapped,
++            areas: std::mem::take(areas),
++            boolean: self.boolean,
++        })
+     }
+ }
+ 
+@@ -144,23 +175,19 @@ impl D3d9Queries {
+         self.occlusion = Some(OcclusionPool {
+             set,
+             boolean: cfg!(target_vendor = "apple"),
+-            next: 0,
+-            outstanding: 0,
+             active: None,
+         });
+         Ok(())
+     }
+ 
+     pub fn destroy(&mut self, handle: u32) -> Result<(), RenderError> {
+-        let record = self
+-            .records
++        self.records
+             .remove(&handle)
+             .ok_or_else(|| RenderError::invalid("DestroyQuery", "unknown query handle"))?;
+         if let Some(pool) = self.occlusion.as_mut() {
+             if pool.active == Some(handle) {
+                 pool.active = None;
+             }
+-            pool.release(&record.occlusion);
+         }
+         Ok(())
+     }
+@@ -189,7 +216,7 @@ impl D3d9Queries {
+         let kind = self.kind(handle, "Issue")?;
+         match kind {
+             D3DQUERYTYPE_EVENT => self.issue_event(gpu, handle, begin),
+-            D3DQUERYTYPE_OCCLUSION if begin => self.begin_occlusion(handle),
++            D3DQUERYTYPE_OCCLUSION if begin => self.begin_occlusion(gpu, handle),
+             D3DQUERYTYPE_OCCLUSION => self.end_occlusion(gpu, handle),
+             _ => Err(RenderError::new("Issue", "query type is not implemented")),
+         }
+@@ -242,7 +269,8 @@ impl D3d9Queries {
+         Ok(())
+     }
+ 
+-    fn begin_occlusion(&mut self, handle: u32) -> Result<(), RenderError> {
++    fn begin_occlusion(&mut self, gpu: &D3d9Gpu, handle: u32) -> Result<(), RenderError> {
++        self.ensure_occlusion_pool(gpu)?;
+         let pool = self
+             .occlusion
+             .as_mut()
+@@ -257,9 +285,10 @@ impl D3d9Queries {
+             .records
+             .get_mut(&handle)
+             .ok_or_else(|| RenderError::invalid("Issue", "unknown query handle"))?;
+-        let previous = std::mem::replace(&mut record.occlusion, Occlusion::Idle);
+-        pool.release(&previous);
+-        record.occlusion = Occlusion::Recording(Vec::new());
++        record.occlusion = Occlusion::Recording {
++            areas: Vec::new(),
++            chunks: Vec::new(),
++        };
+         pool.active = Some(handle);
+         Ok(())
+     }
+@@ -275,95 +304,54 @@ impl D3d9Queries {
+                 "D3DISSUE_END without a matching D3DISSUE_BEGIN",
+             ));
+         }
+-        pool.active = None;
+         let record = self
+             .records
+             .get_mut(&handle)
+             .ok_or_else(|| RenderError::invalid("Issue", "unknown query handle"))?;
+-        let Occlusion::Recording(areas) = std::mem::replace(&mut record.occlusion, Occlusion::Idle)
+-        else {
++        let Occlusion::Recording { areas, chunks } = &mut record.occlusion else {
+             return Err(RenderError::invalid(
+                 "Issue",
+                 "occlusion query is not recording",
+             ));
+         };
+-        if areas.is_empty() {
+-            record.occlusion = Occlusion::Done(0);
+-            pool.retire();
+-            return Ok(());
++        if !areas.is_empty() {
++            chunks.push(pool.resolve(gpu, areas)?);
+         }
+-        let first = pool.next - areas.len() as u32;
+-        let size = areas.len() as u64 * OCCLUSION_STRIDE;
+-        let readback = gpu.validate("Issue", || {
+-            let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+-                label: Some("d3d9-occlusion-resolve"),
+-                size,
+-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+-                mapped_at_creation: false,
+-            });
+-            let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+-                label: Some("d3d9-occlusion-readback"),
+-                size,
+-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+-                mapped_at_creation: false,
+-            });
+-            gpu.record(|encoder, _| {
+-                encoder.resolve_query_set(&pool.set, first..pool.next, &resolve, 0);
+-                encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
+-            });
+-            Ok(readback)
+-        })?;
+-        let mapped = Arc::new(OnceLock::new());
+-        let map_target = readback.clone();
+-        let flag = Arc::clone(&mapped);
+-        let physical = gpu.loss().physical_loss();
+-        gpu.submit_then(move |_| {
+-            if physical.is_lost() {
+-                let _ = flag.set(false);
+-                return;
+-            }
+-            map_target.map_async(wgpu::MapMode::Read, .., move |result| {
+-                let _ = flag.set(result.is_ok());
+-            });
+-        });
+-        record.occlusion = Occlusion::Pending(Readback {
+-            buffer: readback,
+-            mapped,
+-            areas,
+-            boolean: pool.boolean,
+-        });
+-        pool.outstanding += 1;
++        record.occlusion = if chunks.is_empty() {
++            Occlusion::Done(0)
++        } else {
++            Occlusion::Pending(std::mem::take(chunks))
++        };
++        pool.active = None;
+         Ok(())
+     }
+ 
+-    pub(crate) fn open_segment(&mut self, area: u64) -> Result<Option<u32>, RenderError> {
+-        let Some(pool) = self.occlusion.as_mut() else {
++    pub(crate) fn open_segment(
++        &mut self,
++        gpu: &D3d9Gpu,
++        area: u64,
++    ) -> Result<Option<u32>, RenderError> {
++        let Some(pool) = self.occlusion.as_ref() else {
+             return Ok(None);
+         };
+         let Some(handle) = pool.active else {
+             return Ok(None);
+         };
+-        if pool.next >= OCCLUSION_SLOTS {
+-            return Err(RenderError::new(
+-                "DrawFlush",
+-                "occlusion query slots are exhausted",
+-            ));
+-        }
+-        let index = pool.next;
+-        pool.next += 1;
+-        match self
++        let Some(Occlusion::Recording { areas, chunks }) = self
+             .records
+             .get_mut(&handle)
+             .map(|record| &mut record.occlusion)
+-        {
+-            Some(Occlusion::Recording(areas)) => areas.push(area),
+-            _ => {
+-                return Err(RenderError::invalid(
+-                    "DrawFlush",
+-                    "occlusion query is not recording",
+-                ));
+-            }
++        else {
++            return Err(RenderError::invalid(
++                "DrawFlush",
++                "occlusion query is not recording",
++            ));
++        };
++        if areas.len() == OCCLUSION_SLOTS as usize {
++            chunks.push(pool.resolve(gpu, areas)?);
+         }
++        let index = areas.len() as u32;
++        areas.push(area);
+         Ok(Some(index))
+     }
+ 
+@@ -432,7 +420,7 @@ impl D3d9Queries {
+             .ok_or_else(|| RenderError::invalid("GetData", "unknown query handle"))?;
+         match record.occlusion {
+             Occlusion::Idle => return Ok(QueryPoll::Ready(0)),
+-            Occlusion::Recording(_) => return Ok(QueryPoll::Pending),
++            Occlusion::Recording { .. } => return Ok(QueryPoll::Pending),
+             Occlusion::Done(value) => return Ok(QueryPoll::Ready(value)),
+             Occlusion::Pending(_) => {}
+         }
+@@ -446,24 +434,28 @@ impl D3d9Queries {
+             .records
+             .get_mut(&handle)
+             .ok_or_else(|| RenderError::invalid("GetData", "unknown query handle"))?;
+-        let Occlusion::Pending(readback) = &record.occlusion else {
++        let Occlusion::Pending(chunks) = &record.occlusion else {
+             return Ok(QueryPoll::Pending);
+         };
+-        match readback.mapped.get() {
+-            None => return Ok(QueryPoll::Pending),
+-            Some(false) => {
+-                return Err(RenderError::new(
+-                    "GetData",
+-                    "occlusion readback buffer failed to map",
+-                ));
++        for chunk in chunks {
++            match chunk.mapped.get() {
++                None => return Ok(QueryPoll::Pending),
++                Some(false) => {
++                    return Err(RenderError::new(
++                        "GetData",
++                        "occlusion readback buffer failed to map",
++                    ));
++                }
++                Some(true) => {}
+             }
+-            Some(true) => {}
+         }
+-        let value = readback.count()?;
+-        let previous = std::mem::replace(&mut record.occlusion, Occlusion::Done(value));
+-        if let Some(pool) = self.occlusion.as_mut() {
+-            pool.release(&previous);
++        let value = chunks.iter().try_fold(0u32, |total, chunk| {
++            chunk.count().map(|count| total.saturating_add(count))
++        })?;
++        for chunk in chunks {
++            chunk.buffer.unmap();
+         }
++        record.occlusion = Occlusion::Done(value);
+         Ok(QueryPoll::Ready(value))
+     }
+ 
+@@ -472,10 +464,6 @@ impl D3d9Queries {
+             record.generation = 0;
+             record.occlusion = Occlusion::Idle;
+         }
+-        if let Some(pool) = self.occlusion.as_mut() {
+-            pool.active = None;
+-            pool.outstanding = 0;
+-            pool.next = 0;
+-        }
++        self.occlusion = None;
+     }
+ }
+diff --git a/graphics/d3d8-wgpu/src/host_gpu.rs b/graphics/d3d8-wgpu/src/host_gpu.rs
+index 23dd17b2..79d5e741 100644
+--- a/graphics/d3d8-wgpu/src/host_gpu.rs
++++ b/graphics/d3d8-wgpu/src/host_gpu.rs
+@@ -158,18 +158,14 @@ impl Poller {
+                         break;
+                     }
+                 } else if matches!(
+-                    receiver.try_recv(),
+-                    Err(std::sync::mpsc::TryRecvError::Disconnected)
++                    receiver.recv_timeout(std::time::Duration::from_millis(2)),
++                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                 ) {
+                     break;
+                 }
+                 if active.load(std::sync::atomic::Ordering::Acquire) != 0 {
+-                    match context.device.poll(wgpu::PollType::Wait {
+-                        submission_index: None,
+-                        timeout: Some(std::time::Duration::from_millis(10)),
+-                    }) {
+-                        Ok(_) | Err(wgpu::PollError::Timeout) => (),
+-                        Err(error) => eprintln!("host GPU completion polling: {error}"),
++                    if let Err(error) = context.device.poll(wgpu::PollType::Poll) {
++                        eprintln!("host GPU completion polling: {error}");
+                     }
+                 }
+             }
+diff --git a/graphics/d3d8-wgpu/src/host_gpu/surface.rs b/graphics/d3d8-wgpu/src/host_gpu/surface.rs
+index 6703972c..7c0899e0 100644
+--- a/graphics/d3d8-wgpu/src/host_gpu/surface.rs
++++ b/graphics/d3d8-wgpu/src/host_gpu/surface.rs
+@@ -33,8 +33,9 @@ impl SurfaceState {
+         native_surface: *mut c_void,
+     ) -> Result<wgpu::Surface<'static>, String> {
+         use raw_window_handle::{
+-            RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+-            Win32WindowHandle, WindowsDisplayHandle, XlibDisplayHandle, XlibWindowHandle,
++            AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
++            WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
++            XlibDisplayHandle, XlibWindowHandle,
+         };
+         use std::num::NonZeroIsize;
+         use std::ptr::NonNull;
+@@ -77,6 +78,13 @@ impl SurfaceState {
+                     RawWindowHandle::Xlib(XlibWindowHandle::new(window)),
+                 )
+             }
++            4 => {
++                let window = NonNull::new(desc.window).ok_or("surface: null Android window")?;
++                (
++                    RawDisplayHandle::Android(AndroidDisplayHandle::new()),
++                    RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(window)),
++                )
++            }
+             _ => return Err("surface: unsupported SDL window handle".into()),
+         };
+         let surface = unsafe {
+diff --git a/graphics/d3d8-wgpu/src/render/bindings.rs b/graphics/d3d8-wgpu/src/render/bindings.rs
+index fa0f4d5d..d119cdee 100644
+--- a/graphics/d3d8-wgpu/src/render/bindings.rs
++++ b/graphics/d3d8-wgpu/src/render/bindings.rs
+@@ -22,10 +22,19 @@ impl DrawParameters {
+         }
+     }
+ 
++    pub(crate) fn sampler_lod_bias(&mut self, slot: u32, value: u32) {
++        let offset = PIXEL_RASTER_PARAMETER_BYTES + 4 * slot as usize;
++        self.pixel[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
++    }
++
+     pub(crate) fn interpreter_flags(&mut self, opaque: u32, unbound: u32, tint: bool) {
+-        self.pixel[48..52].copy_from_slice(&opaque.to_le_bytes());
+-        self.pixel[52..56].copy_from_slice(&u32::from(tint).to_le_bytes());
+-        self.pixel[56..60].copy_from_slice(&unbound.to_le_bytes());
++        let flags = &mut self.pixel[PIXEL_PARAMETER_BYTES..];
++        for (bytes, value) in flags
++            .chunks_exact_mut(4)
++            .zip([opaque, u32::from(tint), unbound])
++        {
++            bytes.copy_from_slice(&value.to_le_bytes());
++        }
+         self.pixel_size = INTERPRETER_PARAMETER_BYTES;
+     }
+ 
+diff --git a/graphics/d3d8-wgpu/src/render/interpreter.rs b/graphics/d3d8-wgpu/src/render/interpreter.rs
+index 87e847d0..b9b071d7 100644
+--- a/graphics/d3d8-wgpu/src/render/interpreter.rs
++++ b/graphics/d3d8-wgpu/src/render/interpreter.rs
+@@ -343,7 +343,7 @@ impl PreparedInterpreter {
+                     depth: d.depth.clone(),
+                     multisample: d.multisample,
+                 }
+-                .create(device, "d3d9-interpreter");
++                .create(device, "d3d9-interpreter", None);
+                 if trace {
+                     eprintln!(
+                         "[d3d9-uber] prepare-pipeline index={index} ms={:.3} descriptor={d:?}",
+diff --git a/graphics/d3d8-wgpu/src/render/pipeline.rs b/graphics/d3d8-wgpu/src/render/pipeline.rs
+index 8478e9aa..69fb1363 100644
+--- a/graphics/d3d8-wgpu/src/render/pipeline.rs
++++ b/graphics/d3d8-wgpu/src/render/pipeline.rs
+@@ -54,7 +54,12 @@ pub(crate) struct PreparedPipeline {
+ }
+ 
+ impl PreparedPipeline {
+-    pub(crate) fn create(&self, device: &wgpu::Device, label: &str) -> wgpu::RenderPipeline {
++    pub(crate) fn create(
++        &self,
++        device: &wgpu::Device,
++        label: &str,
++        cache: Option<&wgpu::PipelineCache>,
++    ) -> wgpu::RenderPipeline {
+         let layouts = [Some(&self.layout.uniforms), self.layout.material.as_ref()];
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: Some(label),
+@@ -98,7 +103,7 @@ impl PreparedPipeline {
+             depth_stencil: self.depth.clone(),
+             multisample: self.multisample,
+             multiview_mask: None,
+-            cache: None,
++            cache,
+         })
+     }
+ }
+@@ -246,7 +251,7 @@ impl PipelineRecipe {
+                 });
+             let pipeline = self
+                 .prepare(modules.clone(), layout.clone())
+-                .create(device, "specialization-worker");
++                .create(device, "specialization-worker", None);
+             Ok(CompiledPipeline {
+                 pipeline,
+                 modules,
+diff --git a/graphics/d3d8-wgpu/src/shader/interface.rs b/graphics/d3d8-wgpu/src/shader/interface.rs
+index 1f9d8653..ab61398e 100644
+--- a/graphics/d3d8-wgpu/src/shader/interface.rs
++++ b/graphics/d3d8-wgpu/src/shader/interface.rs
+@@ -1,5 +1,6 @@
+ pub(crate) const VERTEX_PARAMETER_BYTES: usize = 272;
+-pub(crate) const PIXEL_PARAMETER_BYTES: usize = 48;
++pub(crate) const PIXEL_RASTER_PARAMETER_BYTES: usize = 48;
++pub(crate) const PIXEL_PARAMETER_BYTES: usize = PIXEL_RASTER_PARAMETER_BYTES + 16 * 4;
+ pub(crate) const INTERPRETER_PARAMETER_BYTES: usize = PIXEL_PARAMETER_BYTES + 16;
+ pub(crate) const TEXTURE_BINDING: u32 = 4;
+ pub(crate) const SAMPLER_BINDING: u32 = 20;
+@@ -14,6 +15,6 @@ pub(crate) fn pixel_parameters(interpreted: bool) -> String {
+         ""
+     };
+     format!(
+-        "struct PSP {{ alpha_ref: f32, alpha_func: i32, fog_mode: i32, pad0: i32, fog_color: vec4<f32>, fog_start: f32, fog_end: f32, fog_density: f32, pad1: f32{flags} }}\n"
++        "struct PSP {{ alpha_ref: f32, alpha_func: i32, fog_mode: i32, pad0: i32, fog_color: vec4<f32>, fog_start: f32, fog_end: f32, fog_density: f32, pad1: f32, lod_bias: array<vec4<f32>, 4>{flags} }}\n"
+     )
+ }
+diff --git a/graphics/d3d8-wgpu/src/shader/opcodes.rs b/graphics/d3d8-wgpu/src/shader/opcodes.rs
+index 90bae74e..936555f6 100644
+--- a/graphics/d3d8-wgpu/src/shader/opcodes.rs
++++ b/graphics/d3d8-wgpu/src/shader/opcodes.rs
+@@ -46,11 +46,20 @@ pub(crate) const OP_TEXKILL: u32 = 65;
+ pub(crate) const OP_TEX: u32 = 66;
+ pub(crate) const OP_TEXREG2AR: u32 = 69;
+ pub(crate) const OP_TEXREG2GB: u32 = 70;
++pub(crate) const OP_TEXM3X2PAD: u32 = 71;
++pub(crate) const OP_TEXM3X2TEX: u32 = 72;
++pub(crate) const OP_TEXM3X3PAD: u32 = 73;
++pub(crate) const OP_TEXM3X3TEX: u32 = 74;
++pub(crate) const OP_TEXM3X3SPEC: u32 = 76;
++pub(crate) const OP_TEXM3X3VSPEC: u32 = 77;
+ pub(crate) const OP_EXPP: u32 = 78;
+ pub(crate) const OP_LOGP: u32 = 79;
+ pub(crate) const OP_CND: u32 = 80;
+ pub(crate) const OP_DEF: u32 = 81;
++pub(crate) const OP_TEXREG2RGB: u32 = 82;
++pub(crate) const OP_TEXDP3TEX: u32 = 83;
+ pub(crate) const OP_TEXDP3: u32 = 85;
++pub(crate) const OP_TEXM3X3: u32 = 86;
+ pub(crate) const OP_CMP: u32 = 88;
+ pub(crate) const OP_DP2ADD: u32 = 90;
+ pub(crate) const OP_DSX: u32 = 91;
+diff --git a/graphics/d3d8-wgpu/src/shader/program.rs b/graphics/d3d8-wgpu/src/shader/program.rs
+index 29f1c86e..ff49134e 100644
+--- a/graphics/d3d8-wgpu/src/shader/program.rs
++++ b/graphics/d3d8-wgpu/src/shader/program.rs
+@@ -129,7 +129,17 @@ fn operand_count(op: u32, major: u32, minor: u32, pixel: bool) -> Option<u32> {
+             }
+         }
+         OP_TEXKILL => 1,
+-        OP_TEXREG2AR | OP_TEXREG2GB => 2,
++        OP_TEXREG2AR
++        | OP_TEXREG2GB
++        | OP_TEXREG2RGB
++        | OP_TEXM3X2PAD
++        | OP_TEXM3X2TEX
++        | OP_TEXM3X3PAD
++        | OP_TEXM3X3TEX
++        | OP_TEXM3X3VSPEC
++        | OP_TEXM3X3
++        | OP_TEXDP3TEX => 2,
++        OP_TEXM3X3SPEC => 3,
+         OP_TEX => {
+             if major >= 2 {
+                 3
+@@ -637,7 +647,15 @@ impl Program {
+         p.sampled_slots = p.code.iter().fold(0, |slots, inst| {
+             let stage = match inst.op {
+                 OP_TEX if p.major >= 2 => Some(inst.src[1].index),
+-                OP_TEX | OP_TEXREG2AR | OP_TEXREG2GB => Some(inst.dst.index),
++                OP_TEX
++                | OP_TEXREG2AR
++                | OP_TEXREG2GB
++                | OP_TEXREG2RGB
++                | OP_TEXM3X2TEX
++                | OP_TEXM3X3TEX
++                | OP_TEXM3X3SPEC
++                | OP_TEXM3X3VSPEC
++                | OP_TEXDP3TEX => Some(inst.dst.index),
+                 _ => None,
+             };
+             slots | stage.and_then(|stage| 1u16.checked_shl(stage)).unwrap_or(0)
+diff --git a/graphics/d3d8-wgpu/src/shader/specialize.rs b/graphics/d3d8-wgpu/src/shader/specialize.rs
+index 68ed18b9..a60e2307 100644
+--- a/graphics/d3d8-wgpu/src/shader/specialize.rs
++++ b/graphics/d3d8-wgpu/src/shader/specialize.rs
+@@ -38,6 +38,7 @@ struct Gen<'a> {
+     stages: BTreeSet<u32>,
+     failed: Option<String>,
+     seq: u32,
++    texm_rows: Vec<(u32, String)>,
+ }
+ 
+ impl<'a> Gen<'a> {
+@@ -49,6 +50,7 @@ impl<'a> Gen<'a> {
+             stages: BTreeSet::new(),
+             failed: None,
+             seq: 0,
++            texm_rows: Vec::new(),
+         }
+     }
+ 
+@@ -284,8 +286,14 @@ impl<'a> Gen<'a> {
+         } else {
+             format!("({c}).xy")
+         };
+-        let sampled = if bias {
+-            format!("textureSampleBias(tx{stage}, sm{stage}, {lookup}, ({coord}).w)")
++        let sampled = if self.p.pixel {
++            let sampler_bias = format!("psp.lod_bias[{}][{}]", stage / 4, stage % 4);
++            let bias = if bias {
++                format!("{sampler_bias} + ({coord}).w")
++            } else {
++                sampler_bias
++            };
++            format!("textureSampleBias(tx{stage}, sm{stage}, {lookup}, {bias})")
+         } else {
+             format!("textureSample(tx{stage}, sm{stage}, {lookup})")
+         };
+@@ -476,6 +484,95 @@ impl<'a> Gen<'a> {
+         self.write(&inst.dst, &sampled);
+     }
+ 
++    fn texreg2rgb(&mut self, inst: &Inst) {
++        let n = inst.dst.index;
++        let src = self.s(inst, 0);
++        let coord = format!("vec4<f32>(({src}).xyz, 1.0)");
++        let sampled = self.sample(n, &coord, false, false);
++        self.write(&inst.dst, &sampled);
++    }
++
++    fn texdp3(&mut self, inst: &Inst, sample: bool) {
++        let n = inst.dst.index;
++        let src = self.s(inst, 0);
++        let d = format!("dot(tc[{n}].xyz, ({src}).xyz)");
++        if sample {
++            let coord = format!("vec4<f32>({d}, 0.0, 0.0, 1.0)");
++            let sampled = self.sample(n, &coord, false, false);
++            self.write(&inst.dst, &sampled);
++        } else {
++            self.write(&inst.dst, &format!("vec4<f32>({d})"));
++        }
++    }
++
++    fn texm_pad(&mut self, inst: &Inst) {
++        let n = inst.dst.index;
++        let src = self.s(inst, 0);
++        let id = self.seq;
++        self.seq += 1;
++        let name = format!("texm{id}");
++        self.body += &format!("let {name}: f32 = dot(tc[{n}].xyz, ({src}).xyz);\n");
++        self.texm_rows.push((n, name));
++    }
++
++    fn texm3x2tex(&mut self, inst: &Inst) {
++        if self.texm_rows.len() != 1 {
++            self.fail("TEXM3x2TEX requires 1 preceding TEXM3x2PAD");
++            return;
++        }
++        let (_, u) = self.texm_rows.remove(0);
++        let n = inst.dst.index;
++        let src = self.s(inst, 0);
++        let coord = format!("vec4<f32>({u}, dot(tc[{n}].xyz, ({src}).xyz), 0.0, 1.0)");
++        let sampled = self.sample(n, &coord, false, false);
++        self.write(&inst.dst, &sampled);
++    }
++
++    fn texm3x3(&mut self, inst: &Inst, mode: u32) {
++        if self.texm_rows.len() != 2 {
++            self.fail("TEXM3x3* requires 2 preceding TEXM3x3PAD instructions");
++            return;
++        }
++        let (d0, u) = self.texm_rows.remove(0);
++        let (d1, v) = self.texm_rows.remove(0);
++        let n = inst.dst.index;
++        let src = self.s(inst, 0);
++        let id = self.seq;
++        self.seq += 1;
++        let vname = format!("texm_v{id}");
++        self.body += &format!(
++            "let {vname}: vec3<f32> = vec3<f32>({u}, {v}, dot(tc[{n}].xyz, ({src}).xyz));\n"
++        );
++        match mode {
++            0 => {
++                // TEXM3x3: store vector directly without sampling
++                self.write(&inst.dst, &format!("vec4<f32>({vname}, 1.0)"));
++            }
++            1 => {
++                // TEXM3x3TEX: sample stage n with (u, v, w)
++                let sampled = self.sample(n, &format!("vec4<f32>({vname}, 1.0)"), false, false);
++                self.write(&inst.dst, &sampled);
++            }
++            2 | 3 => {
++                // 2 = TEXM3x3SPEC (eye in src1), 3 = TEXM3x3VSPEC (eye in tc[d0].w, tc[d1].w, tc[n].w)
++                let eye = if mode == 2 {
++                    format!("({}).xyz", self.s(inst, 1))
++                } else {
++                    format!("vec3<f32>(tc[{d0}].w, tc[{d1}].w, tc[{n}].w)")
++                };
++                let rid = self.seq;
++                self.seq += 1;
++                let rname = format!("texm_r{rid}");
++                self.body += &format!(
++                    "let {rname}: vec3<f32> = 2.0 * (dot({vname}, {eye}) / max(dot({vname}, {vname}), 1e-12)) * {vname} - {eye};\n"
++                );
++                let sampled = self.sample(n, &format!("vec4<f32>({rname}, 1.0)"), false, false);
++                self.write(&inst.dst, &sampled);
++            }
++            _ => unreachable!(),
++        }
++    }
++
+     fn tex(&mut self, inst: &Inst) {
+         if self.p.major >= 2 {
+             let sampler = inst.src[1];
+@@ -509,6 +606,15 @@ impl<'a> Gen<'a> {
+             OP_TEX => self.tex(inst),
+             OP_TEXREG2AR => self.texreg(inst, 3, 0),
+             OP_TEXREG2GB => self.texreg(inst, 1, 2),
++            OP_TEXREG2RGB => self.texreg2rgb(inst),
++            OP_TEXDP3 => self.texdp3(inst, false),
++            OP_TEXDP3TEX => self.texdp3(inst, true),
++            OP_TEXM3X2PAD | OP_TEXM3X3PAD => self.texm_pad(inst),
++            OP_TEXM3X2TEX => self.texm3x2tex(inst),
++            OP_TEXM3X3 => self.texm3x3(inst, 0),
++            OP_TEXM3X3TEX => self.texm3x3(inst, 1),
++            OP_TEXM3X3SPEC => self.texm3x3(inst, 2),
++            OP_TEXM3X3VSPEC => self.texm3x3(inst, 3),
+             _ => {
+                 if let Some(v) = self.pure(inst) {
+                     self.write(&inst.dst, &v);
+diff --git a/graphics/d3d8-wgpu/src/shader/uber/source.rs b/graphics/d3d8-wgpu/src/shader/uber/source.rs
+index 527a6801..8d7d8d05 100644
+--- a/graphics/d3d8-wgpu/src/shader/uber/source.rs
++++ b/graphics/d3d8-wgpu/src/shader/uber/source.rs
+@@ -31,7 +31,9 @@ pub fn source() -> String {
+     for slot in 0..TEXTURE_SLOTS {
+         let components = if slot < TEXTURES_2D { "xy" } else { "xyz" };
+         source += &format!(
+-            "case {slot}u: {{ value = textureSample(tx{slot}, sm{slot}, coord.{components}); }}\n"
++            "case {slot}u: {{ value = textureSampleBias(tx{slot}, sm{slot}, coord.{components}, psp.lod_bias[{}][{}]); }}\n",
++            slot / 4,
++            slot % 4
+         );
+     }
+     source += "default: {} } if ((psp.texture_flags.x & (1u << slot)) != 0u) { value = vec4<f32>(value.rgb, 1.0); } return value; }\n";
+diff --git a/host/controls/controls_host.cpp b/host/controls/controls_host.cpp
+index fd55707f..c14d5682 100644
+--- a/host/controls/controls_host.cpp
++++ b/host/controls/controls_host.cpp
+@@ -152,7 +152,6 @@ bool g_have_layout = false; // g_layout holds a layout the router drives
+ std::string g_loaded_name;
+ Form g_loaded_form = Form::Tablet;
+ double g_file_scale = 1.0;
+-int g_size = -1;
+ bool g_enabled = false;
+ LayoutContent g_content = LayoutContent::Keys; // g_layout's, for auto-hide
+ 
+@@ -165,9 +164,19 @@ uint64_t g_published_revision = 0;
+ double size_factor() {
+     int size = mods_controls_value(CONTROLS_SIZE_ROW);
+     size = size < 0 ? 0 : size > 2 ? 2 : size;
++    if (size == 2 && platform_ui_touch_device() && g_screen.dw >= g_screen.dh &&
++        g_screen.safe.w >= 1500.0 * g_screen.scale &&
++        g_screen.safe.h >= 650.0 * g_screen.scale)
++        return 60.0 / 36.0;
+     return kSizePt[size] / 36.0;
+ }
+ 
++void apply_size() {
++    const double factor = size_factor();
++    g_layout.scale = g_file_scale * factor;
++    g_layout.offset_scale = factor > kSizePt[2] / 36.0 ? factor : 1.0;
++}
++
+ // The groups the player has hidden, as the settings row stores them: bit i
+ // is groups[i], for the first kHiddenBits groups (layout_fallback.h).
+ uint32_t hidden_bits(const Layout &l) {
+@@ -270,7 +279,6 @@ void reload(const std::string &name, Form form) {
+     g_loaded_form = form;
+     g_have_layout = false;
+     g_layout = Layout();
+-    g_size = -1;
+     if (name.empty())
+         return;
+     Layout fresh;
+@@ -385,9 +393,7 @@ void open_editor() {
+     g_rumble.stop();
+     // A reload just before this (a reset, a switch) left the file's own
+     // scale; the editor shows what the player sees, size setting included.
+-    g_size = mods_controls_value(CONTROLS_SIZE_ROW);
+-    g_size = g_size < 0 ? 0 : g_size > 2 ? 2 : g_size;
+-    g_layout.scale = g_file_scale * size_factor();
++    apply_size();
+     g_editor.set_screen(g_screen);
+     g_editor.set_names(g_store.names());
+     g_editor.open(g_layout, g_loaded_form, mods_controls_value(CONTROLS_SNAP_ROW) != 0);
+@@ -686,12 +692,7 @@ void host_pump(uint64_t now) {
+     }
+ 
+     if (g_have_layout) {
+-        int size = mods_controls_value(CONTROLS_SIZE_ROW);
+-        size = size < 0 ? 0 : size > 2 ? 2 : size;
+-        if (size != g_size) {
+-            g_size = size;
+-            g_layout.scale = g_file_scale * size_factor();
+-        }
++        apply_size();
+         // The hidden groups follow the row whoever set it: a toggle writes it
+         // (group_visibility_changed), and a settings load or reset may too.
+         // The row is per form factor, since one name's forms need not have the
+diff --git a/host/controls/editor.cpp b/host/controls/editor.cpp
+index 5ebd0ccc..47026803 100644
+--- a/host/controls/editor.cpp
++++ b/host/controls/editor.cpp
+@@ -375,7 +375,7 @@ void Editor::set_moving_rect(const Rect &r, bool reanchor) {
+     if (!selection_valid())
+         return;
+     Rect area = anchor_area(layout_, screen_);
+-    double scale = screen_.scale > 0 ? screen_.scale : 1.0;
++    const double scale = (screen_.scale > 0 ? screen_.scale : 1.0) * layout_.offset_scale;
+     Group &g = layout_.groups[sel_group_];
+     Anchor *anchor;
+     double *x, *y;
+diff --git a/host/controls/layout.cpp b/host/controls/layout.cpp
+index 4a4140df..a79f88db 100644
+--- a/host/controls/layout.cpp
++++ b/host/controls/layout.cpp
+@@ -565,8 +565,8 @@ Rect group_rect(const Layout &l, int group, const Screen &s) {
+         int pitch = int(lround((key_pt + grp.grid.gap) * s.scale));
+         int w = pitch * grp.grid.cols;
+         int h = pitch * grp.grid.rows;
+-        int ox = px(grp.x, s);
+-        int oy = px(grp.y, s);
++        int ox = px(grp.x * l.offset_scale, s);
++        int oy = px(grp.y * l.offset_scale, s);
+         return place(area, w, h, grp.anchor, ox, oy);
+     }
+     // Non-grid group: the union of its controls' rects.
+@@ -612,8 +612,8 @@ Rect control_rect(const Layout &l, int group, int control, const Screen &s) {
+ 
+     int w = int(lround(c.w * l.scale * s.scale));
+     int h = int(lround(c.h * l.scale * s.scale));
+-    int ox = px(c.x, s);
+-    int oy = px(c.y, s);
++    int ox = px(c.x * l.offset_scale, s);
++    int oy = px(c.y * l.offset_scale, s);
+     Rect r = place(area, w, h, c.anchor, ox, oy);
+ 
+     if (!c.stack_on.empty()) {
+diff --git a/host/controls/layout.h b/host/controls/layout.h
+index ebef9a51..000d8a89 100644
+--- a/host/controls/layout.h
++++ b/host/controls/layout.h
+@@ -83,6 +83,7 @@ struct Layout {
+     double scale = 1.0;     // sizes only (not offsets); the "size" setting multiplies it
+     bool safe_inset = true; // anchors resolve inside the safe area
+     std::vector<Group> groups;
++    double offset_scale = 1.0;
+ };
+ 
+ // Parses a layout JSON document into *out. Unknown top-level and control
+diff --git a/host/gpu/wgpu_device.cpp b/host/gpu/wgpu_device.cpp
+index 82671fd2..aaf983cc 100644
+--- a/host/gpu/wgpu_device.cpp
++++ b/host/gpu/wgpu_device.cpp
+@@ -303,6 +303,10 @@ void WgpuDevice::release_drawable(Swapchain s, Texture t) {
+ }
+ void WgpuDevice::present(CommandBuffer cb, Swapchain s, Texture t, double duration,
+                          std::function<void(double)> fn) {
++    if (!fn) {
++        host_gpu_swapchain_present(gpu_, cb.id, s.id, t.id, duration, nullptr, nullptr);
++        return;
++    }
+     using Callback = std::function<void(double)>;
+     auto *callback = new Callback(std::move(fn));
+     host_gpu_swapchain_present(
+diff --git a/host/gpu/wgpu_surface.cpp b/host/gpu/wgpu_surface.cpp
+index b07a6ee3..3dd97d74 100644
+--- a/host/gpu/wgpu_surface.cpp
++++ b/host/gpu/wgpu_surface.cpp
+@@ -22,8 +22,11 @@ WindowSurface *make_surface(SDL_Window *window, bool owned) {
+         return nullptr;
+     auto props = SDL_GetWindowProperties(window);
+     auto *surface = new WindowSurface{};
+-    surface->window = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+-    if (surface->window) {
++    if ((surface->window =
++             SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr))) {
++        surface->kind = 4;
++    } else if ((surface->window =
++                    SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
+         surface->kind = 1;
+         surface->display =
+             SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
+diff --git a/host/sdl/main.cpp b/host/sdl/main.cpp
+index 8603e5b7..982f16f6 100644
+--- a/host/sdl/main.cpp
++++ b/host/sdl/main.cpp
+@@ -213,6 +213,36 @@ HostWindowSize viewport_window_size_for(int gw, int gh) {
+ // itself, which keeps clear of a camera notch, or else the window's display.
+ std::atomic<int> g_screen_w{0}, g_screen_h{0};
+ std::atomic<double> g_screen_refresh_rate{60.0};
++void limit_guest_render_size(int &w, int &h) {
++#ifdef __ANDROID__
++    static const int render_height = [] {
++        const char *value = recomp_env("ANDROID_RENDER_HEIGHT");
++        if (value && *value) {
++            char *end = nullptr;
++            const long parsed = strtol(value, &end, 10);
++            if (*end == '\0' && parsed == 0)
++                return 0;
++            if (*end == '\0' && parsed >= 480 && parsed <= 2160) {
++                os_setenv("RECOMP_D3D9_LIMIT_DISPLAY_MODES", "1");
++                return int(parsed);
++            }
++        }
++        os_setenv("RECOMP_D3D9_LIMIT_DISPLAY_MODES", "1");
++        return 720;
++    }();
++    if (w < h)
++        std::swap(w, h);
++    const int short_side = h;
++    if (render_height && short_side > render_height) {
++        w = int((int64_t(w) * render_height + short_side / 2) / short_side);
++        h = int((int64_t(h) * render_height + short_side / 2) / short_side);
++    }
++#else
++    (void)w;
++    (void)h;
++#endif
++}
++
+ void note_screen_size() {
+     SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+     double refresh_rate = 0.0;
+@@ -236,10 +266,12 @@ void note_screen_size() {
+     }
+     if (const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(display)) {
+         refresh_rate = std::max(refresh_rate, double(mode->refresh_rate));
+-        const int pw = int(std::lround(mode->w * mode->pixel_density));
+-        const int ph = int(std::lround(mode->h * mode->pixel_density));
+-        if (pw > 0 && ph > 0)
++        int pw = int(std::lround(mode->w * mode->pixel_density));
++        int ph = int(std::lround(mode->h * mode->pixel_density));
++        if (pw > 0 && ph > 0) {
++            limit_guest_render_size(pw, ph);
+             host_display_set_screen(pw, ph);
++        }
+     }
+     if (refresh_rate <= 1.0)
+         refresh_rate = 60.0;
+@@ -247,6 +279,7 @@ void note_screen_size() {
+         fprintf(stderr, "[host] display maximum refresh rate %.3f Hz\n", refresh_rate);
+     if (w <= 0 || h <= 0)
+         return;
++    limit_guest_render_size(w, h);
+     g_screen_w.store(w);
+     g_screen_h.store(h);
+ }
+@@ -1688,6 +1721,8 @@ void fit_borderless_window() {
+ // window events; another setting can supersede it meanwhile.
+ void apply_window_mode() {
+     int request = host_display_take_window();
++    if (!platform_ui_pointer_capture_supported())
++        return;
+     if (request >= 0)
+         g_wanted_window_mode = request;
+     if (!g_window || g_viewport_active || !g_game_window_shown || g_fullscreen_transition)
+@@ -2262,6 +2297,9 @@ int main(int argc, char **argv) {
+ #endif
+ #ifdef __ANDROID__
+     platform_ui_init_hints(); // stdout and stderr reach logcat from here on
++    if (const char *internal = SDL_GetAndroidInternalStoragePath(); internal && *internal)
++        os_setenv("RECOMP_D3D9_PIPELINE_CACHE",
++                  (std::string(internal) + "/d3d9-pipelines.bin").c_str());
+     (void)exe_flag;           // The mobile app always uses its own external data root.
+     // SDL's Java glue has initialized the app-specific external files path
+     // before SDL_main. Resolve it before host_layout caches a profile path.
+diff --git a/runtime/kernel32.cpp b/runtime/kernel32.cpp
+index 33035e39..a1f7abcb 100644
+--- a/runtime/kernel32.cpp
++++ b/runtime/kernel32.cpp
+@@ -1163,6 +1163,13 @@ void get_module_handle_named(X86 *c, const std::string &module_name) {
+     }
+     // Registered DLLs are already available to static imports. Materialize
+     // their pseudo handles through the same path as an explicit LoadLibrary.
++    // Anything else is not loaded in this process; GetModuleHandle must not
++    // try to load an unloaded DLL from disk.
++    if (!imports_has_dll(name.c_str())) {
++        set_last_error(126); // ERROR_MOD_NOT_FOUND
++        set_eax(c, 0);
++        return;
++    }
+     load_library_named(c, module_name);
+ }
+ 
+@@ -1707,6 +1714,37 @@ void k_GetSystemDirectoryA(X86 *c) {
+     set_eax(c, len);
+ }
+ 
++void k_GetWindowsDirectoryA(X86 *c) {
++    static const char dir[] = "C:\\Windows";
++    uint32_t buf = arg(c, 0), size = arg(c, 1);
++    uint32_t len = sizeof dir - 1;
++    if (!buf || size <= len) {
++        set_eax(c, len + 1);
++        return;
++    }
++    memcpy(g_mem + buf, dir, len + 1);
++    set_eax(c, len);
++}
++
++void k_lstrcmpiA(X86 *c) {
++    std::string a = gm_str(arg(c, 0)), b = gm_str(arg(c, 1));
++    const unsigned char *pa = (const unsigned char *)a.c_str();
++    const unsigned char *pb = (const unsigned char *)b.c_str();
++    while (*pa && *pb) {
++        int ca = std::tolower(*pa++);
++        int cb = std::tolower(*pb++);
++        if (ca != cb) {
++            set_eax(c, (uint32_t)(ca - cb));
++            return;
++        }
++    }
++    set_eax(c, (uint32_t)(std::tolower(*pa) - std::tolower(*pb)));
++}
++
++void k_AllocConsole(X86 *c) {
++    set_eax(c, 1);
++}
++
+ // GetTempPathA(nBufferLength, lpBuffer). The guest sees a virtual
+ // "C:\Windows\Temp\" (trailing backslash, as Windows returns it), like
+ // GetSystemDirectoryA's virtual System32: files the guest then creates there go
+@@ -1958,8 +1996,8 @@ void k_GetLongPathNameA(X86 *c) {
+     set_eax(c, gm_put_str(buf, path.c_str(), len));
+ }
+ // The same virtual volume GetDiskFreeSpaceA describes: 4 GiB free of 8 GiB.
+-void k_GetDiskFreeSpaceExA(X86 *c) {
+-    log_once("GetDiskFreeSpaceExA", "GetDiskFreeSpaceExA: reporting a fixed virtual volume");
++void k_GetDiskFreeSpaceEx(X86 *c) {
++    log_once("GetDiskFreeSpaceEx", "GetDiskFreeSpaceEx: reporting a fixed virtual volume");
+     const uint64_t free_bytes = 8ull * 512 * 0x00100000, total = 8ull * 512 * 0x00200000;
+     const uint64_t values[] = {free_bytes, total, free_bytes};
+     for (int i = 0; i < 3; ++i) {
+@@ -5985,7 +6023,8 @@ const ImportShim g_kernel32_shims[] = {
+     {"KERNEL32.dll", "FatalAppExitA", 2, k_FatalAppExitA},
+     {"KERNEL32.dll", "GetDateFormatA", 6, k_GetDateFormatA},
+     {"KERNEL32.dll", "GetTimeFormatA", 6, k_GetTimeFormatA},
+-    {"KERNEL32.dll", "GetDiskFreeSpaceExA", 4, k_GetDiskFreeSpaceExA},
++    {"KERNEL32.dll", "GetDiskFreeSpaceExA", 4, k_GetDiskFreeSpaceEx},
++    {"KERNEL32.dll", "GetDiskFreeSpaceExW", 4, k_GetDiskFreeSpaceEx},
+     {"KERNEL32.dll", "GetLongPathNameA", 3, k_GetLongPathNameA},
+     {"KERNEL32.dll", "GetOverlappedResult", 4, imports_unsupported},
+     {"KERNEL32.dll", "HeapValidate", 3, k_HeapValidate},
+@@ -6078,6 +6117,10 @@ const ImportShim g_kernel32_shims[] = {
+     {"KERNEL32.dll", "GetUserDefaultLCID", 0, k_GetUserDefaultLCID},
+     {"KERNEL32.dll", "GetUserDefaultLangID", 0, k_GetUserDefaultLangID},
+     {"KERNEL32.dll", "GetSystemDefaultLCID", 0, k_GetUserDefaultLCID},
++    {"KERNEL32.dll", "GetSystemDefaultLangID", 0, k_GetUserDefaultLangID},
++    {"KERNEL32.dll", "GetWindowsDirectoryA", 2, k_GetWindowsDirectoryA},
++    {"KERNEL32.dll", "lstrcmpiA", 2, k_lstrcmpiA},
++    {"KERNEL32.dll", "AllocConsole", 0, k_AllocConsole},
+     {"KERNEL32.dll", "IsValidCodePage", 1, k_IsValidCodePage},
+     {"KERNEL32.dll", "IsValidLocale", 2, k_IsValidLocale},
+     {"KERNEL32.dll", "EnumSystemLocalesA", 2, k_EnumSystemLocalesA},
+diff --git a/runtime/kernel32_wide.cpp b/runtime/kernel32_wide.cpp
+index c02796de..4bc74e75 100644
+--- a/runtime/kernel32_wide.cpp
++++ b/runtime/kernel32_wide.cpp
+@@ -580,6 +580,13 @@ uint32_t wstrlen(uint32_t p) {
+ void k_lstrlenW(X86 *c) {
+     set_eax(c, wstrlen(arg(c, 0)));
+ }
++
++void k_lstrcmpW(X86 *c) {
++    uint32_t left = arg(c, 0), right = arg(c, 1);
++    int comparison =
++        left && right ? gm_wstr(left).compare(gm_wstr(right)) : (left != 0) - (right != 0);
++    set_eax(c, (uint32_t)((comparison > 0) - (comparison < 0)));
++}
+ void k_lstrcatW(X86 *c) {
+     uint32_t dest = arg(c, 0), src = arg(c, 1), n = wstrlen(dest), extra = wstrlen(src);
+     if (dest && gm_valid(dest, n * 2) && extra < (GUEST_SIZE - dest) / 2 - n) {
+@@ -1188,6 +1195,7 @@ static const ImportShim g_kernel32_wide[] = {
+     {"KERNEL32.dll", "GetConsoleOutputCP", 0, k_GetConsoleOutputCP},
+ 
+     {"KERNEL32.dll", "lstrlenW", 1, k_lstrlenW},
++    {"KERNEL32.dll", "lstrcmpW", 2, k_lstrcmpW},
+     {"KERNEL32.dll", "lstrcatW", 2, k_lstrcatW},
+     {"KERNEL32.dll", "FormatMessageW", 7, k_FormatMessageW},
+     {"KERNEL32.dll", "OutputDebugStringW", 1, k_OutputDebugStringW},
+diff --git a/runtime/misc.cpp b/runtime/misc.cpp
+index 02fd4aa1..c47587f1 100644
+--- a/runtime/misc.cpp
++++ b/runtime/misc.cpp
+@@ -1903,7 +1903,16 @@ uint32_t mmio_read_at(MmioFile &f, uint32_t offset, void *dst, uint32_t n) {
+     return (uint32_t)fread(dst, 1, n, f.fp);
+ }
+ 
+-void m_mmioOpenA(X86 *c) {
++bool mmio_seek_absolute(MmioFile &f, uint64_t offset) {
++    if (offset > INT32_MAX)
++        return false;
++    if (!f.memory)
++        return fseek(f.fp, (long)offset, SEEK_SET) == 0;
++    f.pos = (uint32_t)offset;
++    return true;
++}
++
++void mmio_open_impl(X86 *c, bool wide) {
+     uint32_t name_ptr = arg(c, 0);
+     uint32_t pinfo = arg(c, 1), flags = arg(c, 2);
+     bool write = (flags & 0x00000001) != 0;     // MMIO_WRITE
+@@ -1938,7 +1947,7 @@ void m_mmioOpenA(X86 *c) {
+         return;
+     }
+ 
+-    std::string name = gm_str(name_ptr, 260);
++    std::string name = wide ? gm_wstr(name_ptr, 260) : gm_str(name_ptr, 260);
+     std::string host = win32_host_path(name, write || readwrite || create);
+     if (recomp_env("TRACE_FILES"))
+         LOGW("file: mmioOpen \"%s\" -> \"%s\"", name.c_str(), host.c_str());
+@@ -1973,6 +1982,14 @@ void m_mmioOpenA(X86 *c) {
+     set_eax(c, h);
+ }
+ 
++void m_mmioOpenA(X86 *c) {
++    mmio_open_impl(c, false);
++}
++
++void m_mmioOpenW(X86 *c) {
++    mmio_open_impl(c, true);
++}
++
+ // Direct buffer access for FOURCC_MEM. All cursors remain guest addresses.
+ // Disk buffering and custom I/O procedures are not implemented here and retain
+ // the import's named unsupported diagnostic rather than reporting false success.
+@@ -2163,7 +2180,21 @@ void m_mmioDescend(X86 *c) {
+     MmioFile &f = it->second;
+     uint32_t want_ckid = rd32(pck + MMCKINFO_OFF_ckid);
+     uint32_t want_fcc = rd32(pck + MMCKINFO_OFF_fccType);
+-    uint32_t start = f.pos, end = f.length;
++    uint64_t start = f.pos, end = f.length;
++    if (!f.memory) {
++        long position = ftell(f.fp);
++        if (position < 0 || fseek(f.fp, 0, SEEK_END) != 0) {
++            set_eax(c, MMIOERR_CANNOTSEEK);
++            return;
++        }
++        long length = ftell(f.fp);
++        if (fseek(f.fp, position, SEEK_SET) != 0 || length < 0) {
++            set_eax(c, MMIOERR_CANNOTSEEK);
++            return;
++        }
++        start = (uint64_t)position;
++        end = std::min<uint64_t>((uint64_t)length, INT32_MAX);
++    }
+     if (parent && gm_valid(parent, MMCKINFO_SIZE)) {
+         uint32_t poff = rd32(parent + MMCKINFO_OFF_dwDataOffset);
+         uint32_t psize = rd32(parent + MMCKINFO_OFF_cksize);
+@@ -2171,17 +2202,20 @@ void m_mmioDescend(X86 *c) {
+         // For a RIFF/LIST parent dwDataOffset points at its form type; the
+         // children begin after it. cksize includes the form type, so the
+         // bound is dwDataOffset + cksize.
+-        start = (pckid == FOURCC_RIFF || pckid == FOURCC_LIST) ? poff + 4 : poff;
+-        end = poff + psize;
++        uint64_t first_child =
++            (uint64_t)poff + (pckid == FOURCC_RIFF || pckid == FOURCC_LIST ? 4 : 0);
++        start = std::max(start, first_child);
++        end = std::min(end, (uint64_t)poff + psize);
+     }
+-    while (start + 8 <= end && start + 8 <= f.length) {
++    while (start + 8 <= end) {
+         uint32_t hdr[2];
+-        if (mmio_read_at(f, start, hdr, 8) != 8)
++        if (mmio_read_at(f, (uint32_t)start, hdr, 8) != 8)
+             break;
+         uint32_t ckid = hdr[0], cksize = hdr[1];
+         bool form = ckid == FOURCC_RIFF || ckid == FOURCC_LIST;
+         uint32_t fcc = 0;
+-        if (form && mmio_read_at(f, start + 8, &fcc, 4) != 4)
++        if (form && (cksize < 4 || start + 12 > end ||
++                     mmio_read_at(f, (uint32_t)(start + 8), &fcc, 4) != 4))
+             break;
+         bool match;
+         if (flags & MMIO_FINDRIFF)
+@@ -2193,20 +2227,19 @@ void m_mmioDescend(X86 *c) {
+         else
+             match = true;
+         if (match) {
++            if (!mmio_seek_absolute(f, start + (form ? 12 : 8))) {
++                set_eax(c, MMIOERR_CANNOTSEEK);
++                return;
++            }
+             wr32(pck + MMCKINFO_OFF_ckid, ckid);
+             wr32(pck + MMCKINFO_OFF_cksize, cksize);
+-            if (form)
+-                wr32(pck + MMCKINFO_OFF_fccType, fcc);
+-            wr32(pck + MMCKINFO_OFF_dwDataOffset, start + 8);
++            wr32(pck + MMCKINFO_OFF_fccType, fcc);
++            wr32(pck + MMCKINFO_OFF_dwDataOffset, (uint32_t)(start + 8));
+             wr32(pck + MMCKINFO_OFF_dwFlags, 0);
+-            f.pos = start + 8;
+             set_eax(c, 0);
+             return;
+         }
+-        uint32_t step = 8 + ((cksize + 1) & ~1u);
+-        if (step < 8 || start + step <= start)
+-            break;
+-        start += step;
++        start += 8 + (uint64_t)cksize + (cksize & 1u);
+     }
+     set_eax(c, MMIOERR_CHUNKNOTFOUND);
+ }
+@@ -2222,7 +2255,10 @@ void m_mmioAscend(X86 *c) {
+     }
+     uint32_t off = rd32(pck + MMCKINFO_OFF_dwDataOffset);
+     uint32_t size = rd32(pck + MMCKINFO_OFF_cksize);
+-    it->second.pos = off + ((size + 1) & ~1u);
++    if (!mmio_seek_absolute(it->second, (uint64_t)off + size + (size & 1u))) {
++        set_eax(c, MMIOERR_CANNOTSEEK);
++        return;
++    }
+     wr32(pck + MMCKINFO_OFF_dwFlags, rd32(pck + MMCKINFO_OFF_dwFlags) & ~MMIO_DIRTY);
+     set_eax(c, 0);
+ }
+@@ -3233,6 +3269,7 @@ const ImportShim g_misc_shims[] = {
+     {"WINMM.dll", "timeBeginPeriod", 1, m_timeBeginPeriod},
+     {"WINMM.dll", "timeEndPeriod", 1, m_timeEndPeriod},
+     {"WINMM.dll", "mmioOpenA", 3, m_mmioOpenA},
++    {"WINMM.dll", "mmioOpenW", 3, m_mmioOpenW},
+     {"WINMM.dll", "mmioGetInfo", 3, m_mmioGetInfo},
+     {"WINMM.dll", "mmioSetInfo", 3, m_mmioSetInfo},
+     {"WINMM.dll", "mmioAdvance", 3, m_mmioAdvance},
+@@ -3309,6 +3346,7 @@ const ImportShim g_misc_shims[] = {
+     {"WS2_32.dll", "ord115", 2, w_WSAStartup},
+     {"WS2_32.dll", "WSACleanup", 0, w_WSACleanup},
+     {"WS2_32.dll", "ord116", 0, w_WSACleanup},
++    {"WS2_32.dll", "WSACancelBlockingCall", 0, w_WSACleanup},
+     {"WS2_32.dll", "WSAGetLastError", 0, w_WSAGetLastError},
+     {"WS2_32.dll", "ord111", 0, w_WSAGetLastError},
+     {"WS2_32.dll", "WSASetLastError", 1, w_WSASetLastError},
+diff --git a/runtime/misc_dlls.cpp b/runtime/misc_dlls.cpp
+index c530ea83..0ce2dae6 100644
+--- a/runtime/misc_dlls.cpp
++++ b/runtime/misc_dlls.cpp
+@@ -1,9 +1,11 @@
+ // Small DLL probes for a runtime with no printer, workstation service or tray.
+ #include "imports.h"
++#include "memory.h"
+ #include "user32_internal.h"
+ #include "win32.h"
+ #include "../platform/os.h"
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -34,6 +36,69 @@ void hapdbg_noop(X86 *c) {
+     set_eax(c, 0);
+ }
+ 
++uint32_t g_uuid_seq = 1;
++void rpc_uuid_create(X86 *c) {
++    uint32_t p = arg(c, 0);
++    if (!p || !gm_valid(p, 16)) {
++        set_eax(c, 1734u); // RPC_S_INVALID_BOUND
++        return;
++    }
++    uint64_t t = os_monotonic_ns();
++    uint32_t s = g_uuid_seq++;
++    uint8_t u[16];
++    for (int i = 0; i < 8; ++i)
++        u[i] = (uint8_t)((t >> (i * 8)) & 0xff);
++    for (int i = 0; i < 4; ++i)
++        u[8 + i] = (uint8_t)((s >> (i * 8)) & 0xff);
++    u[12] = 0x52;
++    u[13] = 0x4b;
++    u[14] = (uint8_t)(s & 0xff);
++    u[15] = (uint8_t)((t >> 8) & 0xff);
++    u[6] = (uint8_t)((u[6] & 0x0f) | 0x40);
++    u[8] = (uint8_t)((u[8] & 0x3f) | 0x80);
++    memcpy(g_mem + p, u, 16);
++    set_eax(c, 0); // RPC_S_OK
++}
++
++void rpc_uuid_to_string_a(X86 *c) {
++    uint32_t p = arg(c, 0), out = arg(c, 1);
++    if (!p || !out || !gm_valid(p, 16) || !gm_valid(out, 4)) {
++        set_eax(c, 87u);
++        return;
++    }
++    uint32_t d1 = rd32(p);
++    uint16_t d2 = rd16(p + 4), d3 = rd16(p + 6);
++    const uint8_t *b = g_mem + p + 8;
++    char text[40];
++    std::snprintf(text, sizeof text, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", d1, d2,
++                  d3, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++    uint32_t buf = heap_alloc(40, true);
++    if (!buf) {
++        wr32(out, 0);
++        set_eax(c, 14u); // RPC_S_OUT_OF_MEMORY
++        return;
++    }
++    memcpy(g_mem + buf, text, std::strlen(text) + 1);
++    wr32(out, buf);
++    set_eax(c, 0);
++}
++
++void rpc_string_free_a(X86 *c) {
++    uint32_t pp = arg(c, 0);
++    if (pp && gm_valid(pp, 4)) {
++        uint32_t s = rd32(pp);
++        if (s)
++            heap_free(s);
++        wr32(pp, 0);
++    }
++    set_eax(c, 0);
++}
++
++void wininet_offline(X86 *c) {
++    set_last_error(12007u); // ERROR_INTERNET_NAME_NOT_RESOLVED
++    set_eax(c, 0);
++}
++
+ // SHLWAPI string and path helpers msxml3 imports. The URL entry points that
+ // need WinINet's parser stay named failures.
+ uint16_t wide_unit(uint32_t p, uint32_t i) {
+@@ -447,6 +512,20 @@ const ImportShim shims[] = {
+      "?OutputToErrConsole@hapdbg@@YAXAAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@"
+      "std@@@Z",
+      ARGC_CDECL, hapdbg_noop},
++    {"RPCRT4.dll", "UuidCreate", 1, rpc_uuid_create},
++    {"RPCRT4.dll", "UuidCreateSequential", 1, rpc_uuid_create},
++    {"RPCRT4.dll", "UuidToStringA", 2, rpc_uuid_to_string_a},
++    {"RPCRT4.dll", "RpcStringFreeA", 1, rpc_string_free_a},
++    {"WININET.dll", "InternetOpenA", 5, wininet_offline},
++    {"WININET.dll", "InternetConnectA", 8, wininet_offline},
++    {"WININET.dll", "HttpOpenRequestA", 8, wininet_offline},
++    {"WININET.dll", "HttpSendRequestA", 5, wininet_offline},
++    {"WININET.dll", "HttpQueryInfoA", 5, wininet_offline},
++    {"WININET.dll", "InternetReadFile", 4, wininet_offline},
++    {"WININET.dll", "InternetQueryOptionA", 4, wininet_offline},
++    {"WININET.dll", "InternetSetOptionA", 4, wininet_offline},
++    {"WININET.dll", "InternetSetStatusCallback", 2, wininet_offline},
++    {"WININET.dll", "InternetCloseHandle", 1, yes},
+ };
+ } // namespace
+ void misc_dlls_register() {
+diff --git a/runtime/x86.h b/runtime/x86.h
+index e2f360d5..4839e9be 100644
+--- a/runtime/x86.h
++++ b/runtime/x86.h
+@@ -255,7 +255,14 @@ static inline double rdf80(uint32_t a) {
+ static inline void wrf80(uint32_t a, double v) {
+     uint64_t m;
+     uint16_t se;
+-    if (isnan(v)) {
++    // A normal binary64 significand fits exactly in the x87 explicit significand.
++    uint64_t bits;
++    RECOMP_BITCOPY(&bits, &v, sizeof(bits));
++    unsigned exponent = (unsigned)((bits >> 52) & 0x7ffu);
++    if (exponent > 0 && exponent < 0x7ffu) {
++        m = (bits << 11) | (UINT64_C(1) << 63);
++        se = (uint16_t)((bits >> 48 & 0x8000u) | (exponent + 16383 - 1023));
++    } else if (isnan(v)) {
+         m = 0xc000000000000000ull;
+         se = 0x7fffu;
+     } else if (isinf(v)) {
+diff --git a/tests/translator/cases/call_method_fact.s b/tests/translator/cases/call_method_fact.s
+index 0493d924..e4fa80b6 100644
+--- a/tests/translator/cases/call_method_fact.s
++++ b/tests/translator/cases/call_method_fact.s
+@@ -24,8 +24,8 @@ call_method_fact:
+     jne skip
+     push ecx
+     push eax
+-    push offset object_va
+     mov edx, offset object_va
++    push edx
+     mov edx, [edx]
+ method_site:
+     call dword ptr [edx + 8]
+diff --git a/tools/build.py b/tools/build.py
+index 7dc14848..9294bf43 100644
+--- a/tools/build.py
++++ b/tools/build.py
+@@ -696,7 +696,7 @@ def build_translator_harness(gen, out):
+                                     "-I", str(objects), "-I", str(ROOT), "-c", str(source), "-o", str(obj)])
+         built.append(str(obj))
+     whole = (["-dynamiclib", "-lc++", "-framework", "CoreFoundation", "-framework", "CoreServices"]
+-             if darwin else ["-shared", "-lm"])
++             if darwin else ["-shared", "-lstdc++", "-lm"])
+     stubs = host_entry_stubs(gen, objects / "host_entries.c")
+     subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
+                                 "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
+@@ -745,7 +745,8 @@ def build_diff_harness(build_root, out):
+     whole = (["-dynamiclib", "-Wl,-force_load," + str(archive)] + [str(p) for p in pieces] + [
+                "-Wl,-rpath," + str(archive.parent.parent), "-lc++",
+                "-framework", "CoreFoundation", "-framework", "CoreServices"] if darwin else
+-             ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
++             ["-shared", "-Wl,-Bsymbolic", "-Wl,--whole-archive", str(archive),
++              "-Wl,--no-whole-archive", "-lstdc++", "-lm"])
+     stubs = host_entry_stubs(gen, out.with_name("host_entries.c"))
+     subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
+                                 "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
+diff --git a/tools/build_compositor.py b/tools/build_compositor.py
+index 3b4e16e3..70e8df63 100644
+--- a/tools/build_compositor.py
++++ b/tools/build_compositor.py
+@@ -2,7 +2,7 @@
+ import argparse
+ import os
+ from pathlib import Path
+-from cargo_build import build_static_library, native_target_args
++from cargo_build import android_cross_env, build_static_library, native_target_args
+ 
+ 
+ def main():
+@@ -14,7 +14,7 @@ def main():
+     parser.add_argument("--target")
+     parser.add_argument("--deployment-target")
+     args = parser.parse_args()
+-    env = dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir))
++    env = android_cross_env(dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir)), args.target)
+     if args.deployment_target:
+         env["MACOSX_DEPLOYMENT_TARGET"] = args.deployment_target
+     try:
+diff --git a/tools/build_d3d8_wgpu.py b/tools/build_d3d8_wgpu.py
+index bd4da032..740fc321 100644
+--- a/tools/build_d3d8_wgpu.py
++++ b/tools/build_d3d8_wgpu.py
+@@ -3,7 +3,7 @@ import os
+ from pathlib import Path
+ import shutil
+ import subprocess
+-from cargo_build import build_static_library, native_target_args
++from cargo_build import android_cross_env, build_static_library, native_target_args, rust_host_target
+ 
+ 
+ def main():
+@@ -22,20 +22,26 @@ def main():
+         target_args = native_target_args(args.target)
+     except ValueError as error:
+         parser.error(str(error))
+-    build_env = dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir), CXX=args.cxx)
++    build_env = android_cross_env(
++        dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir), CXX=args.cxx),
++        args.target,
++        args.cxx,
++    )
+     if args.deployment_target:
+         build_env["MACOSX_DEPLOYMENT_TARGET"] = args.deployment_target
++    extra_args = ["--no-default-features"] if args.target and "android" in args.target else []
+     try:
+         output_dir = build_static_library(args.cargo, args.crate, target_args, build_env,
+-                                          "d3d8_wgpu", args.native_libs)
++                                          "d3d8_wgpu", args.native_libs, extra_cargo_args=extra_args)
+     except RuntimeError as error:
+         parser.exit(1, str(error) + "\n")
+-    corpus = subprocess.run(
+-        [args.cargo, "build", "--release", "--locked", "--manifest-path",
+-         str(args.crate / "Cargo.toml"), "--bin", "shader-corpus", *target_args],
+-        env=build_env)
+-    if corpus.returncode:
+-        parser.exit(corpus.returncode, "D3D8 shader corpus CLI build failed\n")
++    if not args.target or args.target == rust_host_target():
++        corpus = subprocess.run(
++            [args.cargo, "build", "--release", "--locked", "--manifest-path",
++             str(args.crate / "Cargo.toml"), "--bin", "shader-corpus", *target_args],
++            env=build_env)
++        if corpus.returncode:
++            parser.exit(corpus.returncode, "D3D8 shader corpus CLI build failed\n")
+     if output_dir is None:
+         parser.exit(1, "Cargo did not report the D3D8 bridge output directory\n")
+     generated = (
+diff --git a/tools/cargo_build.py b/tools/cargo_build.py
+index 23bb8418..b97b59c5 100644
+--- a/tools/cargo_build.py
++++ b/tools/cargo_build.py
+@@ -5,21 +5,60 @@ import re
+ import subprocess
+ 
+ 
++def rust_host_target():
++    version = subprocess.check_output([os.environ.get("RUSTC", "rustc"), "-vV"], text=True)
++    return next((line.removeprefix("host: ") for line in version.splitlines()
++                 if line.startswith("host: ")), None)
++
++
+ def native_target_args(target):
+     if not target:
+         return []
+-    version = subprocess.check_output([os.environ.get("RUSTC", "rustc"), "-vV"], text=True)
+-    host = next((line.removeprefix("host: ") for line in version.splitlines()
+-                 if line.startswith("host: ")), None)
+-    if target != host:
++    host = rust_host_target()
++    if target != host and "android" not in target:
+         raise ValueError(f"graphics Cargo target {target} does not match Rust host {host}")
+     return ["--target", target]
+ 
+ 
+-def build_static_library(cargo, crate, target_args, env, name, native_libs_path):
++def android_cross_env(env, target, cxx=None):
++    if not target or "android" not in target:
++        return env
++    ndk = env.get("ANDROID_NDK_HOME")
++    if not ndk:
++        return env
++    env = dict(env)
++    prebuilt = Path(ndk) / "toolchains/llvm/prebuilt"
++    host_dirs = sorted(prebuilt.iterdir()) if prebuilt.is_dir() else []
++    if not host_dirs:
++        return env
++    bindir = host_dirs[0] / "bin"
++    api = env.get("ANDROID_PLATFORM_API", "29")
++    cc_bin = bindir / f"{target}{api}-clang"
++    cxx_bin = bindir / f"{target}{api}-clang++"
++    ar_bin = bindir / "llvm-ar"
++    t_under = target.replace("-", "_")
++    t_upper = t_under.upper()
++    if cc_bin.is_file():
++        env.setdefault(f"CC_{t_under}", str(cc_bin))
++    if cxx_bin.is_file():
++        env.setdefault(f"CXX_{t_under}", str(cxx_bin))
++        env["CXX"] = str(cxx_bin)
++        env.setdefault(f"CARGO_TARGET_{t_upper}_LINKER", str(cxx_bin))
++    elif cxx:
++        env.setdefault(f"CXX_{t_under}", cxx)
++    if ar_bin.is_file():
++        env.setdefault(f"AR_{t_under}", str(ar_bin))
++    # Match CMakePresets.json ANDROID_STL=c++_static so link-cplusplus does not
++    # add a DT_NEEDED dependency on unpackaged libc++_shared.so.
++    env.setdefault("CXXSTDLIB", "c++_static")
++    return env
++
++
++def build_static_library(cargo, crate, target_args, env, name, native_libs_path, extra_cargo_args=()):
+     process = subprocess.Popen(
+         [cargo, "rustc", "--release", "--lib", "--locked", "--message-format=json",
+-         "--manifest-path", str(crate / "Cargo.toml"), *target_args, "--", "--print=native-static-libs"],
++         "--manifest-path", str(crate / "Cargo.toml"), *extra_cargo_args, *target_args, "--",
++         "--print=native-static-libs"],
+         env=env, stdout=subprocess.PIPE, text=True)
+     outputs = {}
+     package = None
+diff --git a/tools/game_config.py b/tools/game_config.py
+index b3ee170f..51e44363 100644
+--- a/tools/game_config.py
++++ b/tools/game_config.py
+@@ -652,6 +652,12 @@ def load(game_dir, build_root=None):
+         raise ValueError("%s: [fonts] files must be a list of nonempty paths" % source)
+     if not isinstance(render.setdefault("d3d8_wgpu", False), bool):
+         raise ValueError("%s: [render] d3d8_wgpu must be a boolean" % source)
++    if not isinstance(render.setdefault("d3d9_advertise_pixel_shaders", True), bool):
++        raise ValueError("%s: [render] d3d9_advertise_pixel_shaders must be a boolean" % source)
++    if not isinstance(render.setdefault("d3d9_pace_fullscreen_present", False), bool):
++        raise ValueError("%s: [render] d3d9_pace_fullscreen_present must be a boolean" % source)
++    if not isinstance(render.setdefault("d3d9_full_detail_mips", False), bool):
++        raise ValueError("%s: [render] d3d9_full_detail_mips must be a boolean" % source)
+     if "d3d9_wgpu" in render:
+         raise ValueError("%s: [render] d3d9_wgpu was removed; the Rust D3D9 renderer is always used" % source)
+     input_config = cfg.setdefault("input", {})
+diff --git a/tools/gen_game_config.py b/tools/gen_game_config.py
+index bf84111a..ec9a5c49 100644
+--- a/tools/gen_game_config.py
++++ b/tools/gen_game_config.py
+@@ -155,6 +155,11 @@ def render_cmake(cfg):
+     lines.append("set(RECOMP_STORE_HOOKS %d)" % int(game["store_hooks"]))
+     lines.append("set(RECOMP_CALL_HOOKS %d)" % int(game["call_hooks"]))
+     lines.append("set(RECOMP_AUDIO_MIDI %d)" % int(cfg["audio"]["midi"]))
++    lines.append("set(RECOMP_D3D9_ADVERTISE_PIXEL_SHADERS %d)" %
++                 int(cfg["render"]["d3d9_advertise_pixel_shaders"]))
++    lines.append("set(RECOMP_D3D9_PACE_FULLSCREEN_PRESENT %d)" %
++                 int(cfg["render"]["d3d9_pace_fullscreen_present"]))
++    lines.append("set(RECOMP_D3D9_FULL_DETAIL_MIPS %d)" % int(cfg["render"]["d3d9_full_detail_mips"]))
+     # The generated sources include this header before they define FN_<addr>,
+     # which is how a game replaces one translated function with a native one.
+     lines.append('set(RECOMP_OVERRIDE_HEADER "%s")'
+diff --git a/tools/recomp/diff/host.cpp b/tools/recomp/diff/host.cpp
+index 54aea948..e8a3e105 100644
+--- a/tools/recomp/diff/host.cpp
++++ b/tools/recomp/diff/host.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <string>
+ 
++#include "runtime/imports.h"
+ #include "runtime/x86.h"
+ 
+ extern "C" void harness_escape(const char *reason, uint32_t addr);
+@@ -53,6 +54,12 @@ extern "C" bool imports_dispatch(X86 *c, uint32_t target) {
+     harness_escape("import", target);
+     return false;
+ }
++
++uint32_t imports_resolve(const char *, const char *) {
++    harness_escape("import", 0);
++    return 0;
++}
++
+ extern "C" int recomp_module_region_has_target(uint32_t target) {
+     (void)target;
+     return 0;
+diff --git a/tools/recomp/diff/run.py b/tools/recomp/diff/run.py
+index 2b007189..2b90b8d9 100644
+--- a/tools/recomp/diff/run.py
++++ b/tools/recomp/diff/run.py
+@@ -194,7 +194,8 @@ class Image:
+ 
+ class Native:
+     def __init__(self, dylib, image):
+-        self.lib = C.CDLL(str(dylib), mode=C.RTLD_GLOBAL)
++        mode = C.RTLD_GLOBAL if sys.platform == "darwin" else C.RTLD_LOCAL
++        self.lib = C.CDLL(str(dylib), mode=mode)
+         self.lib.harness_mem.restype = C.c_void_p
+         self.lib.diff_run.restype = C.c_char_p
+         self.lib.diff_run.argtypes = [C.c_uint32, C.POINTER(State), C.c_uint32]
+diff --git a/translator/crates/recomp-translate/src/lib.rs b/translator/crates/recomp-translate/src/lib.rs
+index ca2095ea..b2ec2cbf 100644
+--- a/translator/crates/recomp-translate/src/lib.rs
++++ b/translator/crates/recomp-translate/src/lib.rs
+@@ -588,6 +588,54 @@ fn build_bodies(
+             })
+             .collect(),
+     };
++    if !settings.direct_variants && stack_return_report.is_none() {
++        let pass1: Vec<std::result::Result<(Addr, FunctionIr, bool), BodyRow>> = sources
++            .into_par_iter()
++            .map(|(addr, ir)| {
++                let Some(ir) = ir else {
++                    return Err((addr, trap_body(program, addr, None), None, None));
++                };
++                match plan_one(&ctx, &ir) {
++                    Ok(planned) => Ok((addr, ir, planned.ssa.return_slot.is_ok())),
++                    Err(error) => Err(error_row(&ctx, addr, &ir, &error)),
++                }
++            })
++            .collect();
++        let mut proven_returns = BTreeSet::new();
++        let mut deferred = Vec::with_capacity(pass1.len());
++        for item in pass1 {
++            match item {
++                Err(row) => deferred.push(Err(row)),
++                Ok((addr, ir, proven)) => {
++                    if proven {
++                        proven_returns.insert(addr);
++                    }
++                    deferred.push(Ok((addr, ir)));
++                }
++            }
++        }
++        let ctx2 = make_ctx(proven_returns, direct_arguments.clone());
++        let phase2: Vec<BodyRow> = deferred
++            .into_par_iter()
++            .map(|item| match item {
++                Err(row) => row,
++                Ok((addr, ir)) => match plan_one(&ctx2, &ir) {
++                    Ok(planned) => emit_row(&ctx2, addr, &ir, &planned),
++                    Err(error) => error_row(&ctx2, addr, &ir, &error),
++                },
++            })
++            .collect();
++        let mut stats = EmitStats {
++            direct_arguments,
++            ..EmitStats::default()
++        };
++        let mut bodies = Vec::new();
++        for row in phase2 {
++            account(&mut stats, row, &mut bodies);
++        }
++        bodies.sort_by_key(|body| body.addr);
++        return Ok((bodies, stats, direct_targets));
++    }
+     let planning_started = std::time::Instant::now();
+     let prepared: Vec<Prepared> = sources
+         .into_par_iter()
+diff --git a/translator/crates/rk-x86/src/correct.rs b/translator/crates/rk-x86/src/correct.rs
+index c109c426..7ae4649c 100644
+--- a/translator/crates/rk-x86/src/correct.rs
++++ b/translator/crates/rk-x86/src/correct.rs
+@@ -622,13 +622,15 @@ pub(crate) fn correct_cmpxchg8b(
+     Ok(out)
+ }
+ 
+-pub(crate) fn correct_bsr(
++fn correct_bit_scan(
++    forward: bool,
+     ops: &[PcodeOp],
+     regs: &Registers,
+     fresh: &mut dyn FnMut(u32) -> Varnode,
+ ) -> Result<Vec<PcodeOp>, Reason> {
++    let name = if forward { "BSF" } else { "BSR" };
+     let unsupported = || Reason::Unsupported {
+-        detail: "unsupported BSR p-code shape".into(),
++        detail: format!("unsupported {name} p-code shape"),
+     };
+     let zf = regs.arch().x86.zf;
+     let at = ops
+@@ -657,8 +659,17 @@ pub(crate) fn correct_bsr(
+     let changed = fresh(dst.size);
+     let selected = fresh(dst.size);
+     let mut out = ops[..=at].to_vec();
++    let scan_src = if forward {
++        let neg = fresh(dst.size);
++        let isolated = fresh(dst.size);
++        out.push(op(OpCode::Int2Comp, neg, vec![source]));
++        out.push(op(OpCode::IntAnd, isolated, vec![source, neg]));
++        isolated
++    } else {
++        source
++    };
+     out.extend([
+-        op(OpCode::LzCount, leading, vec![source]),
++        op(OpCode::LzCount, leading, vec![scan_src]),
+         op(
+             OpCode::IntSub,
+             index,
+@@ -680,6 +691,22 @@ pub(crate) fn correct_bsr(
+     Ok(out)
+ }
+ 
++pub(crate) fn correct_bsr(
++    ops: &[PcodeOp],
++    regs: &Registers,
++    fresh: &mut dyn FnMut(u32) -> Varnode,
++) -> Result<Vec<PcodeOp>, Reason> {
++    correct_bit_scan(false, ops, regs, fresh)
++}
++
++pub(crate) fn correct_bsf(
++    ops: &[PcodeOp],
++    regs: &Registers,
++    fresh: &mut dyn FnMut(u32) -> Varnode,
++) -> Result<Vec<PcodeOp>, Reason> {
++    correct_bit_scan(true, ops, regs, fresh)
++}
++
+ fn without_flags(ops: Vec<PcodeOp>, regs: &Registers, live: &[Varnode]) -> Vec<PcodeOp> {
+     let flags = regs.arch().x86.arithmetic_flags();
+     let mut live: Vec<Varnode> = live.to_vec();
+diff --git a/translator/crates/rk-x86/src/lower.rs b/translator/crates/rk-x86/src/lower.rs
+index 75021290..61b50d10 100644
+--- a/translator/crates/rk-x86/src/lower.rs
++++ b/translator/crates/rk-x86/src/lower.rs
+@@ -7,7 +7,8 @@ use rk_ir::{
+ };
+ 
+ use crate::correct::{
+-    correct_bsr, correct_div_cg, correct_extra, correct_sar, correct_shift, correct_sse, lazy_flags,
++    correct_bsf, correct_bsr, correct_div_cg, correct_extra, correct_sar, correct_shift,
++    correct_sse, lazy_flags,
+ };
+ use crate::flags::flag_op;
+ use crate::string;
+@@ -457,6 +458,7 @@ impl IsaLowering for Lowering<'_> {
+                 (None, "SHL" | "SHR") => correct_shift(&mnem, &ops, regs, &mut |size| cx.fresh(size)),
+                 (None, "SAR") => correct_sar(&ops, regs, &mut |size| cx.fresh(size)),
+                 (None, "BSR") => correct_bsr(&ops, regs, &mut |size| cx.fresh(size)),
++                (None, "BSF") => correct_bsf(&ops, regs, &mut |size| cx.fresh(size)),
+                 (None, _) => Ok(ops.clone()),
+             }?;
+             Ok(corrected)
+@@ -559,6 +561,7 @@ const SUPPORTED: &[&str] = &[
+     "NOT",
+     "BSWAP",
+     "BSR",
++    "BSF",
+     "LEAVE",
+     "LEA",
+     "PUSH",

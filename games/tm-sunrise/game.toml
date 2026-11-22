@@ -1,0 +1,27 @@
+[game]
+id = "tm-sunrise"
+name = "TrackMania Sunrise"
+app_name = "TmSunriseRecomp"
+bundle_id = "dev.recompkit.tmsunrise"
+executable = "TmSunrise.exe"
+sha256 = "a6820000345824e961e4cee9a88a7fdb8261d890b4eb7bc1f0657a2996ed2d64"
+image_base = 0x00400000
+guest_size = 0x18000000
+host_arena_base = 0
+entry_point = 0x00c42000
+guest_root = 'C:\Program Files\TmSunrise'
+
+[setup]
+supported_version = "TrackMania Sunrise 1.4.6 (2005 Retail ISO, StarForce 3.04.071.019 — copy-protection blocked)"
+source_notes = "Extract TMSUNRIS.EXE from TM-Sunrise.iso with innoextract 1.9+ and select the extracted app/ folder containing TmSunrise.exe. Note: this retail release is StarForce-encrypted; a DRM-free/authorized unpacked TrackMania Sunrise eXtreme release is required to progress past entry point 0x00c42000."
+
+[translate]
+code_map = "metadata"
+discover = false
+entry_points = [0x00c42000]
+
+[render]
+d3d8_wgpu = true
+
+[controls]
+mobile_control = "mobile-only"

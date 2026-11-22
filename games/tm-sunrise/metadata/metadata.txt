@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=TmSunrise.exe
+executable_sha256=a6820000345824e961e4cee9a88a7fdb8261d890b4eb7bc1f0657a2996ed2d64
+language=x86:LE:32:default
+image_base=00400000
+functions=10
+instructions=171
+instruction_bytes=434

@@ -1,0 +1,21 @@
+# Keep original game files, ISOs, local tools, and generated builds local.
+TMSunrise/
+tmsx-portable/
+local/
+recomp-toolkit/build/
+recomp-toolkit/.venv/
+**/build/
+*.iso
+*.apk
+*.exe
+*.dll
+*.dat
+*.Gbx
+*.gbx
+__pycache__/
+*.pyc
+
+# Toolkit checkout and private handoff notes
+/recomp-toolkit/
+/continue.md
+/.env
