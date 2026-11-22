@@ -6,7 +6,7 @@ Original game files, ISOs, local toolchains, and generated builds remain local (
 
 ## AI assistance and manual review
 
-Most changes were made with ChatGPT using GPT-6.2-Sol. The changes received partial manual review.
+Most changes were made with Codex using GPT-6.2-Sol. The changes received partial manual review.
 
 ## Build from source
 
