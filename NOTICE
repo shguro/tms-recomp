@@ -1,0 +1,10 @@
+This project provides the TrackMania Sunrise game profile, analysis tools,
+build documentation, and compatibility patches for Recomp Toolkit.
+
+The Recomp Toolkit patch is based on the toolkit's native implementation.
+See patches/LICENSE.recomp-toolkit for the toolkit's license and copyright
+notices.
+
+TrackMania Sunrise and its original game data belong to their respective
+rights holders. This repository requires a separately supplied game
+installation and is unaffiliated with the original developers or publishers.
