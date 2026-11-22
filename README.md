@@ -4,6 +4,10 @@ Project-owned integration profile, Ghidra export tooling, reusable Recomp Toolki
 
 Original game files, ISOs, local toolchains, and generated builds remain local (`TMSunrise/`, `tmsx-portable/`, `local/`, and `recomp-toolkit/build/` are excluded via `.gitignore`). The active profile targets the locally supplied eXtreme `0.1.5.0` executable.
 
+## AI assistance and manual review
+
+Most changes were made with ChatGPT using GPT-6.2-Sol. The changes received partial manual review.
+
 ## Build from source
 
 Use a local copy of the eXtreme 0.1.5.0 game data that you are entitled to use. The tested portable edition is listed on the [Internet Archive](https://archive.org/details/tmsx-portable). See the [game profile](games/tm-sunrise-extreme/README.md) for the executable checksum and setup commands.
